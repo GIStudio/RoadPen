@@ -73,74 +73,75 @@ function lineIntersection(p: Point, d: Point, q: Point, e: Point): Point | null 
   return add(p, scale(d, t));
 }
 
-function catmullRomBezierPoints(points: Point[], tension = 0.5, segments = 12): Point[] {
-  const n = points.length;
-  if (n <= 2) {
-    return points.map((p) => ({ ...p }));
-  }
-
-  const samplePerSegment = Math.max(3, Math.floor(segments));
-  const output: Point[] = [];
-
-  for (let i = 0; i < n - 1; i += 1) {
-    const p0 = points[Math.max(0, i - 1)];
-    const p1 = points[i];
-    const p2 = points[i + 1];
-    const p3 = points[Math.min(n - 1, i + 2)];
-
-    for (let s = 0; s < samplePerSegment; s += 1) {
-      const t = s / samplePerSegment;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      const x =
-        0.5 *
-        (2 * p1.x +
-          (p2.x - p0.x) * tension * t +
-          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
-          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
-      const y =
-        0.5 *
-        (2 * p1.y +
-          (p2.y - p0.y) * tension * t +
-          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
-          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
-      output.push({ x, y });
-    }
-  }
-
-  output.push({ ...points[n - 1] });
-  return output;
-}
-
-function quadraticBezierPoints(points: [Point, Point, Point], segments = 24): Point[] {
+function cubicBezierPoints(p0: Point, p1: Point, p2: Point, p3: Point, segments = 24): Point[] {
   const steps = Math.max(6, Math.floor(segments));
-  const [p0, p1, p2] = points;
   const output: Point[] = [];
 
   for (let i = 0; i <= steps; i += 1) {
     const t = i / steps;
     const mt = 1 - t;
     output.push({
-      x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x,
-      y: mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y,
+      x: mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x,
+      y: mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y,
     });
   }
 
   return output;
 }
 
-export function smoothPathByPoints(points: Point[], tension = 0.5, segments = 12): Point[] {
+function pushDistinct(points: Point[], point: Point): void {
+  if (!points.length || distance(points[points.length - 1], point) > 1e-6) {
+    points.push({ x: point.x, y: point.y });
+  }
+}
+
+function sampleCenterTurn(turn: TurnSpec, samplesPerTurn: number): Point[] {
+  const handle = (4 / 3) * turn.radius * Math.tan(turn.delta / 4);
+  const c1 = add(turn.a, scale(turn.u, handle));
+  const c2 = add(turn.b, scale(turn.v, -handle));
+  return cubicBezierPoints(turn.a, c1, c2, turn.b, samplesPerTurn);
+}
+
+export function buildSkeletonPathByPoints(points: Point[], maxOffset = 12, options: GeometryOptions = {}): Point[] {
   const input = sanitizePoints(points);
-  if (input.length < 2) {
+  if (input.length < 3) {
     return input.map((p) => ({ ...p }));
   }
-  if (input.length === 2) {
-    return input.map((p) => ({ ...p }));
+
+  const samplesPerTurn = options.samplesPerTurn ?? 24;
+  const turns = computeTurnSpecs(input, maxOffset, {
+    angleThresholdDeg: options.turnOptions?.angleThresholdDeg ?? 6,
+    radiusFactor: options.turnOptions?.radiusFactor ?? 2.2,
+    clampRatio: options.turnOptions?.clampRatio ?? 0.45,
+    minInnerRadius: options.turnOptions?.minInnerRadius ?? 0.4,
+  });
+
+  const output: Point[] = [];
+  pushDistinct(output, input[0]);
+
+  for (let i = 1; i < input.length - 1; i += 1) {
+    const turn = turns.get(i) ?? null;
+    if (!turn) {
+      pushDistinct(output, input[i]);
+      continue;
+    }
+
+    pushDistinct(output, turn.a);
+    for (const point of sampleCenterTurn(turn, samplesPerTurn)) {
+      pushDistinct(output, point);
+    }
+    pushDistinct(output, turn.b);
   }
-  if (input.length === 3) {
-    return quadraticBezierPoints([input[0], input[1], input[2]], segments * 2);
-  }
-  return catmullRomBezierPoints(input, tension, segments);
+
+  pushDistinct(output, input[input.length - 1]);
+  return output;
+}
+
+export function smoothPathByPoints(points: Point[], tension = 0.5, segments = 12): Point[] {
+  const maxOffset = Math.max(4, 12 * Math.max(0.25, tension));
+  return buildSkeletonPathByPoints(points, maxOffset, {
+    samplesPerTurn: segments * 2,
+  });
 }
 
 export function profileToBands(profile: {

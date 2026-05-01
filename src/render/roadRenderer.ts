@@ -1,12 +1,15 @@
-import type { JunctionType, LaneBand, Point, RoadEdge, RoadPenScene, SceneNode } from "../types";
+import type { JunctionType, LaneBand, Point, RoadPenScene, SceneNode } from "../types";
+import type { JunctionAnalysis, JunctionPatch } from "../geometry/junctionGeometry";
+import { buildJunctionGeometry } from "../geometry/junctionGeometry";
+import type { SnapTarget } from "../geometry/topology";
 import {
   buildBandPolygon,
+  buildSkeletonPathByPoints,
   buildSmoothBandPolygon,
   buildLaneBandsForProfile,
   computeTurnSpecs,
   distance,
   profileToBands,
-  smoothPathByPoints,
 } from "../geometry/roadGeometry";
 import { mergeRoadJunction, multiPolygonToRings } from "../geometry/roadMerge";
 
@@ -14,6 +17,8 @@ interface RenderContext {
   width: number;
   height: number;
   draftPoints?: Point[];
+  snapPreview?: SnapTarget | null;
+  intersectionPreview?: Point[];
 }
 
 export interface BandBucket {
@@ -23,13 +28,15 @@ export interface BandBucket {
 
 export interface RoadBandData {
   bandBuckets: Map<string, BandBucket>;
+  junctions: JunctionAnalysis[];
+  junctionPatches: JunctionPatch[];
+  edgeCenterlines: Array<{
+    edgeId: string;
+    geomType: string;
+    rawPoints: Point[];
+    renderPoints: Point[];
+  }>;
   warnings: string[];
-}
-
-export interface JunctionLabel {
-  nodeId: string;
-  type: JunctionType;
-  degree: number;
 }
 
 const EPS = 1e-9;
@@ -75,10 +82,6 @@ function indexNodes(scene: RoadPenScene): Map<string, SceneNode> {
   return map;
 }
 
-function addOrZero(value: number, fallback = 0): number {
-  return Number.isFinite(value) ? value : fallback;
-}
-
 export function polygonArea(points: Point[]): number {
   let area = 0;
   for (let i = 0; i < points.length; i += 1) {
@@ -87,63 +90,6 @@ export function polygonArea(points: Point[]): number {
     area += a.x * b.y - b.x * a.y;
   }
   return area * 0.5;
-}
-
-function normalize(v: Point): Point {
-  const len = Math.hypot(v.x, v.y);
-  if (len <= EPS) {
-    return { x: 0, y: 0 };
-  }
-  return { x: v.x / len, y: v.y / len };
-}
-
-function classifyJunction(vectors: Point[]): JunctionType {
-  const n = vectors.length;
-  if (n <= 1) {
-    return "line";
-  }
-  if (n === 2) {
-    const a = normalize(vectors[0]);
-    const b = normalize(vectors[1]);
-    return a.x * b.x + a.y * b.y < -0.82 ? "line" : "curve";
-  }
-  if (n === 3) {
-    return "t";
-  }
-  return "cross";
-}
-
-function detectJunctionLabels(scene: RoadPenScene): JunctionLabel[] {
-  const nodeMap = indexNodes(scene);
-  const junctions: JunctionLabel[] = [];
-
-  for (const node of scene.nodes) {
-    const vectors: Point[] = [];
-    for (const edge of scene.edges) {
-      if (edge.from !== node.id && edge.to !== node.id) {
-        continue;
-      }
-
-      const otherId = edge.from === node.id ? edge.to : edge.from;
-      const other = nodeMap.get(otherId);
-      if (!other) {
-        continue;
-      }
-      vectors.push({
-        x: addOrZero(other.x - node.x),
-        y: addOrZero(other.y - node.y),
-      });
-    }
-
-    const type = classifyJunction(vectors);
-    junctions.push({
-      nodeId: node.id,
-      type,
-      degree: vectors.length,
-    });
-  }
-
-  return junctions;
 }
 
 function drawRing(ctx: CanvasRenderingContext2D, ring: Point[]): void {
@@ -159,21 +105,43 @@ function drawRing(ctx: CanvasRenderingContext2D, ring: Point[]): void {
   ctx.closePath();
 }
 
-function drawJunctionLabels(ctx: CanvasRenderingContext2D, scene: RoadPenScene, labels: JunctionLabel[]): void {
-  const nodeMap = indexNodes(scene);
+function drawJunctionMarker(ctx: CanvasRenderingContext2D, junction: JunctionAnalysis): void {
+  if (junction.type !== "t" && junction.type !== "cross") {
+    return;
+  }
+
+  const style = JUNCTION_STYLE[junction.type];
+  const { x, y } = junction.point;
+  ctx.save();
+  ctx.beginPath();
+  ctx.fillStyle = style.fill;
+  ctx.strokeStyle = style.border;
+  ctx.lineWidth = 1.5;
+  ctx.arc(x, y, junction.type === "cross" ? 12 : 10, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = style.fillText;
+  ctx.font = "bold 12px 'Figtree', 'PingFang SC', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(style.text, x, y + 0.5);
+  ctx.restore();
+}
+
+function drawJunctionLabels(ctx: CanvasRenderingContext2D, labels: JunctionAnalysis[]): void {
   ctx.save();
   ctx.font = "12px 'Figtree', 'PingFang SC', sans-serif";
   ctx.textBaseline = "middle";
 
   for (const label of labels) {
-    const node = nodeMap.get(label.nodeId);
-    if (!node) {
+    if (label.type !== "t" && label.type !== "cross") {
       continue;
     }
+    drawJunctionMarker(ctx, label);
     const style = JUNCTION_STYLE[label.type];
     const text = style.text;
-    const x = node.x + 8;
-    const y = node.y - 14;
+    const x = label.point.x + 8;
+    const y = label.point.y - 14;
     const metrics = ctx.measureText(text);
     const width = Math.max(36, metrics.width + 10);
     const height = 17;
@@ -197,9 +165,82 @@ function drawJunctionLabels(ctx: CanvasRenderingContext2D, scene: RoadPenScene, 
   ctx.restore();
 }
 
+function drawSnapPreview(ctx: CanvasRenderingContext2D, scene: RoadPenScene, preview: SnapTarget | null | undefined): void {
+  if (!preview || preview.type === "free") {
+    return;
+  }
+
+  ctx.save();
+  if (preview.type === "edge") {
+    const edge = scene.edges.find((item) => item.id === preview.edgeId);
+    const a = edge?.controlPoints[preview.segmentIndex];
+    const b = edge?.controlPoints[preview.segmentIndex + 1];
+    if (a && b) {
+      ctx.strokeStyle = "rgba(250, 204, 21, 0.95)";
+      ctx.lineWidth = 5;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  }
+
+  const label = preview.type === "node" ? "节点吸附" : "道路吸附";
+  const point = preview.point;
+  ctx.beginPath();
+  ctx.fillStyle = preview.type === "node" ? "rgba(56, 189, 248, 0.22)" : "rgba(250, 204, 21, 0.22)";
+  ctx.strokeStyle = preview.type === "node" ? "#38bdf8" : "#facc15";
+  ctx.lineWidth = 2;
+  ctx.arc(point.x, point.y, preview.type === "node" ? 13 : 11, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = "12px 'Figtree', 'PingFang SC', sans-serif";
+  ctx.textBaseline = "middle";
+  const metrics = ctx.measureText(label);
+  const width = metrics.width + 14;
+  const x = point.x + 12;
+  const y = point.y - 18;
+  ctx.beginPath();
+  ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
+  ctx.strokeStyle = preview.type === "node" ? "#38bdf8" : "#facc15";
+  ctx.roundRect(x, y - 10, width, 20, 6);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#f8fafc";
+  ctx.fillText(label, x + 7, y + 0.5);
+  ctx.restore();
+}
+
+function drawIntersectionPreview(ctx: CanvasRenderingContext2D, points: Point[] | undefined): void {
+  if (!points || points.length === 0) {
+    return;
+  }
+
+  ctx.save();
+  ctx.strokeStyle = "#fb7185";
+  ctx.fillStyle = "rgba(251, 113, 133, 0.22)";
+  ctx.lineWidth = 2;
+  for (const point of points) {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 12, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(point.x - 6, point.y - 6);
+    ctx.lineTo(point.x + 6, point.y + 6);
+    ctx.moveTo(point.x + 6, point.y - 6);
+    ctx.lineTo(point.x - 6, point.y + 6);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   const nodeMap = indexNodes(scene);
   const bandBuckets = new Map<string, BandBucket>();
+  const edgeCenterlines: RoadBandData["edgeCenterlines"] = [];
   const warnings = new Set<string>();
 
   const profileMap = new Map<string, { carriagewayWidth: number; facilityWidth: number; sidewalkWidth: number; clearanceWidth: number }>();
@@ -224,18 +265,33 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
       continue;
     }
 
-    const isSpline = edge.geomType === "spline";
-    let centerline = edge.controlPoints.map((p) => ({ ...p }));
-    if (isSpline) {
-      centerline = smoothPathByPoints(centerline, 0.5, 14);
-    }
-
     const bands = buildLaneBandsForProfile(edge.profileId, profileMap);
     if (bands.length === 0) {
       continue;
     }
 
     const maxOffset = Math.max(...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
+    const isSpline = edge.geomType === "spline";
+    const rawCenterline = edge.controlPoints.map((p) => ({ ...p }));
+    const splineTurnOptions = {
+      angleThresholdDeg: 6,
+      radiusFactor: 2.2,
+      clampRatio: 0.45,
+      minInnerRadius: 0.4,
+    };
+    const centerline = isSpline
+      ? buildSkeletonPathByPoints(rawCenterline, maxOffset, {
+          samplesPerTurn: 20,
+          turnOptions: splineTurnOptions,
+        })
+      : rawCenterline;
+    edgeCenterlines.push({
+      edgeId: edge.id,
+      geomType: edge.geomType,
+      rawPoints: rawCenterline.map((point) => ({ ...point })),
+      renderPoints: centerline.map((point) => ({ ...point })),
+    });
+
     const turns = isSpline
       ? new Map()
       : computeTurnSpecs(centerline, maxOffset, {
@@ -266,6 +322,17 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     }
   }
 
+  const junctionGeometry = buildJunctionGeometry(scene, profileMap);
+  for (const warning of junctionGeometry.warnings) {
+    warnings.add(warning);
+  }
+
+  for (const patch of junctionGeometry.patches) {
+    const bucket = bandBuckets.get(patch.bandId) ?? { band: { ...patch.band }, polygons: [] };
+    bandBuckets.set(patch.bandId, bucket);
+    bucket.polygons.push(patch.polygon);
+  }
+
   if (!bandBuckets.has("carriageway")) {
     const defaultBands = profileToBands({
       carriagewayWidth: 24,
@@ -280,6 +347,9 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
 
   return {
     bandBuckets,
+    junctions: junctionGeometry.junctions,
+    junctionPatches: junctionGeometry.patches,
+    edgeCenterlines,
     warnings: [...warnings],
   };
 }
@@ -289,12 +359,11 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     return [];
   }
 
-  const { width, height, draftPoints } = params;
+  const { width, height, draftPoints, snapPreview, intersectionPreview } = params;
   ctx.clearRect(0, 0, width, height);
 
-  const { bandBuckets, warnings: geometryWarnings } = buildRoadBandPolygons(scene);
+  const { bandBuckets, junctions, warnings: geometryWarnings } = buildRoadBandPolygons(scene);
   const orderedBands = [...bandBuckets.values()].sort((a, b) => b.band.zIndex - a.band.zIndex);
-  const junctionLabels = detectJunctionLabels(scene);
 
   for (const bucket of orderedBands) {
     const merged = mergeRoadJunction(bucket.polygons);
@@ -321,7 +390,9 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     }
   }
 
-  drawJunctionLabels(ctx, scene, junctionLabels);
+  drawJunctionLabels(ctx, junctions);
+  drawSnapPreview(ctx, scene, snapPreview);
+  drawIntersectionPreview(ctx, intersectionPreview);
 
   if (draftPoints && draftPoints.length > 1) {
     ctx.strokeStyle = "rgba(250, 204, 21, 0.95)";

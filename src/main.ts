@@ -3,14 +3,16 @@ import "antd/dist/reset.css";
 import * as G6 from "@antv/g6";
 import * as React from "react";
 import { createRoot } from "react-dom/client";
-import type { GeometryType, Point, RoadEdge, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
+import type { Point, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
 import { exportScene, parseRoadPenScene } from "./io/io";
 import { exportRoadSvg } from "./io/svgExport";
 import { renderRoads } from "./render/roadRenderer";
 import { ToolbarApp } from "./ui/ToolbarApp";
+import { commitRoadWithTopology, findPathRoadIntersections, findSnapTarget, type DraftAnchor, type SnapTarget } from "./geometry/topology";
 
 const CANVAS_BG = "#0a1024";
 const SNAP_RADIUS = 12;
+const EDGE_SNAP_RADIUS = 16;
 
 const DEFAULT_PROFILE_ID = "default";
 
@@ -26,7 +28,9 @@ interface AppState {
   scene: RoadPenScene;
   mode: AppMode;
   draftPoints: Point[];
+  draftAnchors: DraftAnchor[];
   draftStartNodeId: string | null;
+  snapPreview: SnapTarget | null;
   selectedProfileId: string;
 }
 
@@ -52,7 +56,9 @@ const app: AppState = {
   scene: structuredClone(emptyScene),
   mode: "select",
   draftPoints: [],
+  draftAnchors: [],
   draftStartNodeId: null,
+  snapPreview: null,
   selectedProfileId: DEFAULT_PROFILE_ID,
 };
 
@@ -214,8 +220,85 @@ function findSnapNode(point: Point, excludeId?: string): { id: string; point: Po
   return hit ? { id: hit.id, point: hit.point } : null;
 }
 
-function geometryTypeForControlPoints(controlPoints: Point[]): GeometryType {
-  return controlPoints.length === 2 ? "polyline" : "spline";
+function snapTargetForPoint(point: Point): SnapTarget {
+  return findSnapTarget(app.scene, point, {
+    nodeRadius: SNAP_RADIUS,
+    edgeRadius: EDGE_SNAP_RADIUS,
+  });
+}
+
+function pushDraftAnchor(anchor: DraftAnchor): void {
+  app.draftPoints.push({ ...anchor.point });
+  app.draftAnchors.push({
+    point: { ...anchor.point },
+    snap: anchor.snap,
+  });
+}
+
+function freeAnchor(point: Point): DraftAnchor {
+  return {
+    point: { ...point },
+    snap: {
+      type: "free",
+      point: { ...point },
+      distance: 0,
+    },
+  };
+}
+
+function anchorFromSnapTarget(target: SnapTarget): DraftAnchor {
+  return {
+    point: { ...target.point },
+    snap: target,
+  };
+}
+
+function nodeAnchor(nodeId: string, point: Point): DraftAnchor {
+  return {
+    point: { ...point },
+    snap: {
+      type: "node",
+      point: { ...point },
+      distance: 0,
+      nodeId,
+    },
+  };
+}
+
+function clearDraft(): void {
+  app.draftPoints = [];
+  app.draftAnchors = [];
+  app.draftStartNodeId = null;
+  app.snapPreview = null;
+}
+
+function candidatePreviewPath(): Point[] | null {
+  if (!app.snapPreview || app.draftPoints.length === 0) {
+    return null;
+  }
+  const path = [...app.draftPoints.map((point) => ({ ...point })), { ...app.snapPreview.point }];
+  if (path.length >= 2 && Math.hypot(path[path.length - 1].x - path[path.length - 2].x, path[path.length - 1].y - path[path.length - 2].y) < 1e-6) {
+    return null;
+  }
+  return path;
+}
+
+function candidateIntersectionPoints(): Point[] {
+  const path = candidatePreviewPath();
+  return path ? findPathRoadIntersections(app.scene, path, true).map((hit) => hit.point) : [];
+}
+
+function snapStatusText(): string | null {
+  if (candidateIntersectionPoints().length > 0) {
+    return "检测到十字交叉，将自动生成路口";
+  }
+  if (!app.snapPreview || app.snapPreview.type === "free") {
+    return null;
+  }
+  if (app.snapPreview.type === "node") {
+    return `将连接到节点 ${app.snapPreview.nodeId}`;
+  }
+  return `将拆分道路 ${app.snapPreview.edgeId} 形成 T 路口`;
 }
 
 function emitToolbarState(): void {
@@ -379,9 +462,9 @@ function bindGraphEvents(): void {
       return;
     }
     const point = getCanvasPointFromEvent(evt);
-    const snapped = findSnapNode(point);
-    const finalPoint = snapped ? { ...snapped.point } : point;
-    app.draftPoints.push(finalPoint);
+    const snap = snapTargetForPoint(point);
+    pushDraftAnchor(anchorFromSnapTarget(snap));
+    app.snapPreview = snap;
     requestRender();
   });
 
@@ -396,67 +479,106 @@ function bindGraphEvents(): void {
     }
 
     const point = { x: model.x, y: model.y };
-    app.draftPoints.push({ ...point });
+    pushDraftAnchor(nodeAnchor(model.id, point));
     if (!app.draftStartNodeId) {
       app.draftStartNodeId = model.id;
     }
 
     requestRender();
   });
-}
 
-function getOrCreateNodeAt(point: Point): string {
-  const snapped = findSnapNode(point);
-  if (snapped) {
-    return snapped.id;
-  }
+  graph.on("edge:click", (evt: any) => {
+    if (app.mode !== "draw") {
+      return;
+    }
+    const point = getCanvasPointFromEvent(evt);
+    const snap = snapTargetForPoint(point);
+    pushDraftAnchor(anchorFromSnapTarget(snap));
+    app.snapPreview = snap;
+    requestRender();
+  });
 
-  const id = nextNodeId();
-  sceneWarnings = [];
-  const node: SceneNode = { id, x: point.x, y: point.y };
-  app.scene.nodes.push(node);
-  syncGraph();
+  graph.on("canvas:mousemove", (evt: any) => {
+    if (app.mode !== "draw") {
+      app.snapPreview = null;
+      return;
+    }
+    app.snapPreview = snapTargetForPoint(getCanvasPointFromEvent(evt));
+    requestRender();
+  });
 
-  return id;
+  graph.on("node:mousemove", (evt: any) => {
+    if (app.mode !== "draw") {
+      app.snapPreview = null;
+      return;
+    }
+    const model = evt.item?.getModel?.();
+    if (!model) {
+      return;
+    }
+    app.snapPreview = {
+      type: "node",
+      point: { x: model.x, y: model.y },
+      distance: 0,
+      nodeId: model.id,
+    };
+    requestRender();
+  });
+
+  graph.on("edge:mousemove", (evt: any) => {
+    if (app.mode !== "draw") {
+      app.snapPreview = null;
+      return;
+    }
+    app.snapPreview = snapTargetForPoint(getCanvasPointFromEvent(evt));
+    requestRender();
+  });
+
+  addManagedEventListener(graphRoot, "mouseleave", () => {
+    app.snapPreview = null;
+    requestRender();
+  });
 }
 
 function addEdgeFromDraft(chain = false): void {
   sceneWarnings = [];
   if (app.draftPoints.length < 2) {
-    app.draftPoints = [];
-    app.draftStartNodeId = null;
+    clearDraft();
     requestRender();
     return;
   }
 
-  const from = getOrCreateNodeAt(app.draftPoints[0]);
-  const to = getOrCreateNodeAt(app.draftPoints[app.draftPoints.length - 1]);
-  if (from === to) {
-    app.draftPoints = chain ? [app.draftPoints[app.draftPoints.length - 1]] : [];
-    app.draftStartNodeId = chain ? to : null;
+  const anchors =
+    app.draftAnchors.length === app.draftPoints.length
+      ? app.draftAnchors
+      : app.draftPoints.map((point) => freeAnchor(point));
+  const result = commitRoadWithTopology(app.scene, anchors, app.selectedProfileId, nextNodeId, nextEdgeId);
+  if (!result || result.createdEdgeIds.length === 0) {
+    if (result?.warnings.length) {
+      sceneWarnings = result.warnings;
+    }
+    clearDraft();
     requestRender();
     return;
   }
 
-  const controlPoints = app.draftPoints.map((pt) => ({ ...pt }));
-  const edge: RoadEdge = {
-    id: nextEdgeId(),
-    from,
-    to,
-    geomType: geometryTypeForControlPoints(controlPoints),
-    profileId: app.selectedProfileId,
-    controlPoints,
-  };
-
-  app.scene.edges.push(edge);
+  sceneWarnings = result.warnings;
   syncGraph();
 
   if (chain) {
-    app.draftPoints = [app.draftPoints[app.draftPoints.length - 1]];
-    app.draftStartNodeId = to;
+    const toNode = findNodeById(result.toNodeId);
+    if (toNode) {
+      const point = { x: toNode.x, y: toNode.y };
+      const anchor = nodeAnchor(result.toNodeId, point);
+      app.draftPoints = [{ ...point }];
+      app.draftAnchors = [anchor];
+      app.draftStartNodeId = result.toNodeId;
+      app.snapPreview = null;
+    } else {
+      clearDraft();
+    }
   } else {
-    app.draftPoints = [];
-    app.draftStartNodeId = null;
+    clearDraft();
   }
 
   requestRender();
@@ -465,8 +587,7 @@ function addEdgeFromDraft(chain = false): void {
 function finishDraft(chain = false): void {
   if (app.draftPoints.length < 2) {
     if (!chain) {
-      app.draftPoints = [];
-      app.draftStartNodeId = null;
+      clearDraft();
     }
     requestRender();
     return;
@@ -474,8 +595,7 @@ function finishDraft(chain = false): void {
 
   addEdgeFromDraft(chain);
   if (!chain) {
-    app.draftPoints = [];
-    app.draftStartNodeId = null;
+    clearDraft();
   }
 }
 
@@ -518,13 +638,18 @@ function requestRender(): void {
       width,
       height,
       draftPoints: app.draftPoints,
+      snapPreview: app.snapPreview,
+      intersectionPreview: candidateIntersectionPoints(),
     });
     const allWarnings = [...new Set([...sceneWarnings, ...warnings])];
     updateWarningPanel(allWarnings);
 
     if (app.mode === "draw") {
+      const snapText = snapStatusText();
       statusBar.textContent =
-        app.draftPoints.length > 0
+        snapText
+          ? `模式：绘制 | ${snapText}`
+          : app.draftPoints.length > 0
           ? `模式：绘制 | 草稿点数 ${app.draftPoints.length}`
           : "模式：绘制 | 点击空白或节点添加控制点，继续点击继续，Enter/结束绘制";
     } else {
@@ -544,8 +669,7 @@ function syncGraph(): void {
 function switchMode(mode: AppMode): void {
   app.mode = mode;
   if (mode === "select") {
-    app.draftPoints = [];
-    app.draftStartNodeId = null;
+    clearDraft();
   }
   requestRender();
 }
@@ -614,8 +738,7 @@ function importFromFile(file: File): void {
     syncCountersFromScene();
     syncGraph();
 
-    app.draftPoints = [];
-    app.draftStartNodeId = null;
+    clearDraft();
 
     requestRender();
 
@@ -660,8 +783,7 @@ function setupListeners(): void {
   addManagedEventListener(window, "keydown", (event) => {
     const keyboardEvent = event as KeyboardEvent;
     if (keyboardEvent.key === "Escape") {
-      app.draftPoints = [];
-      app.draftStartNodeId = null;
+      clearDraft();
       requestRender();
       return;
     }

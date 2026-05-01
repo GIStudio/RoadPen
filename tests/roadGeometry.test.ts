@@ -1,5 +1,11 @@
 import { describe, expect, test } from "vitest";
-import { buildBandPolygon, buildSmoothBandPolygon, computeTurnSpecs, smoothPathByPoints } from "../src/geometry/roadGeometry";
+import {
+  buildBandPolygon,
+  buildSkeletonPathByPoints,
+  buildSmoothBandPolygon,
+  computeTurnSpecs,
+  smoothPathByPoints,
+} from "../src/geometry/roadGeometry";
 import type { Point } from "../src/types";
 
 function cross(a: Point, b: Point, c: Point): number {
@@ -98,6 +104,22 @@ describe("roadGeometry", () => {
     expect(curve[curve.length - 1]).toEqual(points[2]);
     expect(curve.some((point) => point.y > 40)).toBe(true);
     expect(curve.some((point) => Math.abs(point.x - 50) < 1e-6 && Math.abs(point.y - 100) < 1e-6)).toBe(false);
+  });
+
+  test("三点骨架应保留两端直线，只在拐点附近生成转弯段", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 100, y: 100 },
+    ];
+    const path = buildSkeletonPathByPoints(points, 12, { samplesPerTurn: 12 });
+
+    expect(path[0]).toEqual(points[0]);
+    expect(path[path.length - 1]).toEqual(points[2]);
+    expect(path.some((point) => Math.abs(point.x - 100) < 1e-6 && Math.abs(point.y) < 1e-6)).toBe(false);
+    expect(path[1].x).toBeGreaterThan(40);
+    expect(Math.abs(path[1].y)).toBeLessThan(1e-6);
+    expect(path.some((point) => Math.abs(point.x - 100) < 1e-6 && point.y > 40)).toBe(true);
   });
 
   test("三点弯道展开成道路面时不应产生自交 polygon", () => {

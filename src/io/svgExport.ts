@@ -40,7 +40,7 @@ function polylinePoints(points: Point[]): string {
   return points.map((point) => `${fmt(point.x)},${fmt(point.y)}`).join(" ");
 }
 
-function sceneMeta(scene: RoadPenScene): string {
+function sceneMeta(scene: RoadPenScene, junctions: Array<{ nodeId: string; type: string; degree: number }>): string {
   return esc(
     JSON.stringify(
       {
@@ -52,6 +52,11 @@ function sceneMeta(scene: RoadPenScene): string {
           geomType: edge.geomType,
           controlPoints: edge.controlPoints.length,
         })),
+        junctions: junctions.map((junction) => ({
+          nodeId: junction.nodeId,
+          type: junction.type,
+          degree: junction.degree,
+        })),
       },
       null,
       2,
@@ -61,13 +66,13 @@ function sceneMeta(scene: RoadPenScene): string {
 
 export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): string {
   const { width, height, draftPoints } = options;
-  const { bandBuckets, warnings } = buildRoadBandPolygons(scene);
+  const { bandBuckets, junctions, junctionPatches, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
   const orderedBands = [...bandBuckets.values()].sort((a, b) => b.band.zIndex - a.band.zIndex);
 
   const out: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${fmt(width)}" height="${fmt(height)}" viewBox="0 0 ${fmt(width)} ${fmt(height)}">`,
     "  <metadata>",
-    `    ${sceneMeta(scene)}`,
+    `    ${sceneMeta(scene, junctions)}`,
     "  </metadata>",
     `  <rect id="background" x="0" y="0" width="${fmt(width)}" height="${fmt(height)}" fill="#0a1024"/>`,
     '  <g id="rendered-road-bands">',
@@ -110,15 +115,47 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
     });
   }
 
+  out.push(
+    "  </g>",
+    '  <g id="junction-patches" opacity="0.45" fill="rgba(250, 204, 21, 0.28)" stroke="#facc15" stroke-width="1.25">',
+  );
+
+  junctionPatches.forEach((patch, index) => {
+    out.push(
+      `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" d="${ringToPath(patch.polygon)}"/>`,
+    );
+  });
+
+  out.push("  </g>", '  <g id="junction-labels" font-family="Figtree, PingFang SC, sans-serif" text-anchor="middle">');
+
+  junctions.forEach((junction) => {
+    if (junction.type !== "t" && junction.type !== "cross") {
+      return;
+    }
+    const label = junction.type === "cross" ? "X" : "T";
+    out.push(
+      `    <circle id="junction-label-${esc(junction.nodeId)}" cx="${fmt(junction.point.x)}" cy="${fmt(junction.point.y)}" r="${junction.type === "cross" ? 12 : 10}" fill="rgba(37, 99, 235, 0.88)" stroke="#bfdbfe" stroke-width="1.5"/>`,
+      `    <text x="${fmt(junction.point.x)}" y="${fmt(junction.point.y + 4)}" fill="#f8fafc" font-size="12" font-weight="700">${label}</text>`,
+    );
+  });
+
+  out.push("  </g>", '  <g id="rendered-centerlines" fill="none">');
+
+  for (const edge of edgeCenterlines) {
+    out.push(
+      `    <polyline id="rendered-centerline-${esc(edge.edgeId)}" data-geom-type="${edge.geomType}" points="${polylinePoints(edge.renderPoints)}" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+    );
+  }
+
   out.push("  </g>", '  <g id="edge-centerlines" fill="none">');
 
-  for (const edge of scene.edges) {
+  for (const edge of edgeCenterlines) {
     out.push(
-      `    <polyline id="centerline-${esc(edge.id)}" data-geom-type="${edge.geomType}" points="${polylinePoints(edge.controlPoints)}" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+      `    <polyline id="centerline-${esc(edge.edgeId)}" data-geom-type="${edge.geomType}" points="${polylinePoints(edge.rawPoints)}" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
     );
-    edge.controlPoints.forEach((point, index) => {
+    edge.rawPoints.forEach((point, index) => {
       out.push(
-        `    <circle id="control-${esc(edge.id)}-${index}" cx="${fmt(point.x)}" cy="${fmt(point.y)}" r="3" fill="#f97316" stroke="#fff7ed" stroke-width="1"/>`,
+        `    <circle id="control-${esc(edge.edgeId)}-${index}" cx="${fmt(point.x)}" cy="${fmt(point.y)}" r="3" fill="#f97316" stroke="#fff7ed" stroke-width="1"/>`,
       );
     });
   }
