@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { buildSmoothBandPolygon, computeTurnSpecs, smoothPathByPoints } from "../src/geometry/roadGeometry";
+import { buildBandPolygon, buildSmoothBandPolygon, computeTurnSpecs, smoothPathByPoints } from "../src/geometry/roadGeometry";
 import type { Point } from "../src/types";
 
 function cross(a: Point, b: Point, c: Point): number {
@@ -42,6 +42,23 @@ function hasSelfIntersection(points: Point[]): boolean {
 }
 
 describe("roadGeometry", () => {
+  test("两个点应生成笔直道路面", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+    ];
+    const polygon = buildBandPolygon(points, new Map(), -12, 12);
+
+    expect(polygon).toEqual([
+      { x: 0, y: 12 },
+      { x: 100, y: 12 },
+      { x: 100, y: -12 },
+      { x: 0, y: -12 },
+      { x: 0, y: 12 },
+    ]);
+    expect(hasSelfIntersection(polygon)).toBe(false);
+  });
+
   test("直线控制点应平滑后保持同一直线", () => {
     const line: Point[] = [
       { x: 0, y: 10 },

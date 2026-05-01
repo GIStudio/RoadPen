@@ -3,7 +3,7 @@ import "antd/dist/reset.css";
 import * as G6 from "@antv/g6";
 import * as React from "react";
 import { createRoot } from "react-dom/client";
-import type { Point, RoadEdge, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
+import type { GeometryType, Point, RoadEdge, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
 import { exportScene, parseRoadPenScene } from "./io/io";
 import { exportRoadSvg } from "./io/svgExport";
 import { renderRoads } from "./render/roadRenderer";
@@ -212,6 +212,10 @@ function findSnapNode(point: Point, excludeId?: string): { id: string; point: Po
     }
   }
   return hit ? { id: hit.id, point: hit.point } : null;
+}
+
+function geometryTypeForControlPoints(controlPoints: Point[]): GeometryType {
+  return controlPoints.length === 2 ? "polyline" : "spline";
 }
 
 function emitToolbarState(): void {
@@ -439,7 +443,7 @@ function addEdgeFromDraft(chain = false): void {
     id: nextEdgeId(),
     from,
     to,
-    geomType: controlPoints.length > 2 ? "spline" : "polyline",
+    geomType: geometryTypeForControlPoints(controlPoints),
     profileId: app.selectedProfileId,
     controlPoints,
   };

@@ -409,7 +409,7 @@ export function buildBandPolygon(
   const outer = buildBoundaryPath(centerline, turns, maxQ, samplesPerTurn);
   const inner = buildBoundaryPath(centerline, turns, minQ, samplesPerTurn);
 
-  if (outer.length < 3 || inner.length < 3) {
+  if (outer.length < 2 || inner.length < 2) {
     return [];
   }
 
