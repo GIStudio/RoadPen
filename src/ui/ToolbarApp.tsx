@@ -1,0 +1,65 @@
+import { useEffect, useState } from "react";
+import { Button, Segmented } from "antd";
+import type { ToolbarAction, ToolbarState } from "../types";
+
+const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
+  { label: "选择", value: "select" },
+  { label: "绘制", value: "draw" },
+];
+
+const DEFAULT_STATE: ToolbarState = {
+  mode: "select",
+  draftPoints: 0,
+  warningCount: 0,
+  canFinish: false,
+};
+
+function emitAction(action: ToolbarAction): void {
+  window.dispatchEvent(new CustomEvent<ToolbarAction>("roadpen:action", { detail: action }));
+}
+
+export function ToolbarApp(): JSX.Element {
+  const [state, setState] = useState<ToolbarState>(DEFAULT_STATE);
+
+  useEffect(() => {
+    const onState = (event: Event): void => {
+      const nextState = (event as CustomEvent<ToolbarState>).detail;
+      if (!nextState) {
+        return;
+      }
+      setState(nextState);
+    };
+
+    window.addEventListener("roadpen:state", onState as EventListener);
+    return () => {
+      window.removeEventListener("roadpen:state", onState as EventListener);
+    };
+  }, []);
+
+  return (
+    <div className="toolbar-action-wrap">
+      <Segmented
+        options={TOOLBAR_MODES}
+        value={state.mode}
+        onChange={(value) => emitAction(value as "select" | "draw")}
+      />
+      <Button
+        danger
+        type="primary"
+        onClick={() => emitAction("finish")}
+        disabled={!state.canFinish}
+      >
+        结束绘制
+      </Button>
+      <Button type="primary" onClick={() => emitAction("export")}>
+        导出
+      </Button>
+      <Button type="default" onClick={() => emitAction("exportSvg")}>
+        导出 SVG
+      </Button>
+      <Button type="default" onClick={() => emitAction("import")}>
+        导入
+      </Button>
+    </div>
+  );
+}

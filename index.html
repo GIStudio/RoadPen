@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%234cc9f0'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-size='16' font-family='Arial' font-weight='700' fill='%23080f1e'%3ER%3C/text%3E%3C/svg%3E"
+    />
+    <title>RoadPen</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="toolbar">
+        <div class="toolbar-left">
+          <h1>RoadPen</h1>
+          <span>V1 · 绘制/导入/导出</span>
+        </div>
+        <div class="toolbar-right">
+          <div id="toolbar-root"></div>
+          <input id="importInput" type="file" accept=".roadpen.json,application/json,.json" />
+        </div>
+      </header>
+
+      <main class="canvas-wrap">
+        <div id="graph" class="graph-layer"></div>
+        <canvas id="roadCanvas" class="road-layer"></canvas>
+        <div id="warningPanel" class="warning-panel" hidden>
+          <div class="warning-title">警告</div>
+          <ul id="warningList" class="warning-list"></ul>
+        </div>
+        <div id="statusBar" class="status-bar">模式：选择</div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
