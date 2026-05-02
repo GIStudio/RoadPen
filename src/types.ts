@@ -67,11 +67,21 @@ export interface TurnSpec {
   warning?: string;
 }
 
-export type ToolbarAction = "select" | "draw" | "finish" | "export" | "exportSvg" | "import" | "endFree" | "endClosed";
+export type ToolbarAction =
+  | "select"
+  | "draw"
+  | "finish"
+  | "export"
+  | "exportSvg"
+  | "import"
+  | "endFree"
+  | "endClosed"
+  | "toggleDebug";
 
 export interface ToolbarState {
   mode: "select" | "draw";
   endMode: RoadEndMode;
+  debugMode: boolean;
   draftPoints: number;
   warningCount: number;
   canFinish: boolean;

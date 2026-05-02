@@ -10,6 +10,7 @@ const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
 const DEFAULT_STATE: ToolbarState = {
   mode: "select",
   endMode: "free",
+  debugMode: false,
   draftPoints: 0,
   warningCount: 0,
   canFinish: false,
@@ -70,6 +71,12 @@ export function ToolbarApp(): JSX.Element {
       </Button>
       <Button type="default" onClick={() => emitAction("exportSvg")}>
         导出 SVG
+      </Button>
+      <Button
+        type={state.debugMode ? "primary" : "default"}
+        onClick={() => emitAction("toggleDebug")}
+      >
+        {state.debugMode ? "调试：开" : "调试：关"}
       </Button>
       <Button type="default" onClick={() => emitAction("import")}>
         导入

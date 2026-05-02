@@ -122,7 +122,7 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
 
   junctionPatches.forEach((patch, index) => {
     out.push(
-      `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" d="${ringToPath(patch.polygon)}"/>`,
+      `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" data-kind="${esc(patch.kind ?? "unknown")}" d="${ringToPath(patch.polygon)}"/>`,
     );
   });
 
@@ -154,7 +154,7 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
 
   for (const edge of edgeCenterlines) {
     out.push(
-      `    <polyline id="rendered-centerline-${esc(edge.edgeId)}" data-geom-type="${edge.geomType}" points="${polylinePoints(edge.renderPoints)}" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+      `    <polyline id="rendered-centerline-${esc(edge.id)}" data-geom-type="${edge.geomType}" data-edge-ids="${esc(edge.edgeIds.join(","))}" points="${polylinePoints(edge.renderPoints)}" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
     );
   }
 
@@ -162,11 +162,11 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
 
   for (const edge of edgeCenterlines) {
     out.push(
-      `    <polyline id="centerline-${esc(edge.edgeId)}" data-geom-type="${edge.geomType}" points="${polylinePoints(edge.rawPoints)}" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+      `    <polyline id="centerline-${esc(edge.id)}" data-geom-type="${edge.geomType}" data-edge-ids="${esc(edge.edgeIds.join(","))}" points="${polylinePoints(edge.rawPoints)}" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
     );
     edge.rawPoints.forEach((point, index) => {
       out.push(
-        `    <circle id="control-${esc(edge.edgeId)}-${index}" cx="${fmt(point.x)}" cy="${fmt(point.y)}" r="3" fill="#f97316" stroke="#fff7ed" stroke-width="1"/>`,
+        `    <circle id="control-${esc(edge.id)}-${index}" cx="${fmt(point.x)}" cy="${fmt(point.y)}" r="3" fill="#f97316" stroke="#fff7ed" stroke-width="1"/>`,
       );
     });
   }

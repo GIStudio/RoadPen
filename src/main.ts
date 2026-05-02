@@ -33,6 +33,7 @@ interface AppState {
   snapPreview: SnapTarget | null;
   selectedEndMode: RoadEndMode;
   selectedProfileId: string;
+  debugMode: boolean;
 }
 
 const emptyScene: RoadPenScene = {
@@ -62,6 +63,7 @@ const app: AppState = {
   snapPreview: null,
   selectedEndMode: "free",
   selectedProfileId: DEFAULT_PROFILE_ID,
+  debugMode: false,
 };
 
 let nodeSerial = 0;
@@ -307,6 +309,7 @@ function emitToolbarState(): void {
   const nextState: ToolbarState = {
     mode: app.mode,
     endMode: app.selectedEndMode,
+    debugMode: app.debugMode,
     draftPoints: app.draftPoints.length,
     warningCount: sceneWarnings.length,
     canFinish: app.mode === "draw" && app.draftPoints.length >= 2,
@@ -353,6 +356,11 @@ function handleToolbarAction(action: ToolbarAction): void {
   }
   if (action === "endClosed") {
     app.selectedEndMode = "closed";
+    requestRender();
+    return;
+  }
+  if (action === "toggleDebug") {
+    app.debugMode = !app.debugMode;
     requestRender();
   }
 }
@@ -653,6 +661,7 @@ function requestRender(): void {
       draftPoints: app.draftPoints,
       snapPreview: app.snapPreview,
       intersectionPreview: candidateIntersectionPoints(),
+      debugMode: app.debugMode,
     });
     const allWarnings = [...new Set([...sceneWarnings, ...warnings])];
     updateWarningPanel(allWarnings);

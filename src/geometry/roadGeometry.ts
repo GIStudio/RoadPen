@@ -163,8 +163,8 @@ export function profileToBands(profile: {
       name: "carriageway",
       qInner: -halfRoad,
       qOuter: halfRoad,
-      color: "rgba(45, 55, 72, 0.95)",
-      zIndex: 40,
+      color: "rgb(45, 55, 72)",
+      zIndex: 50,
     },
     {
       id: "facility_left",
@@ -301,7 +301,7 @@ export function computeTurnSpecs(
   return turns;
 }
 
-function offsetTurnCurve(turn: TurnSpec, q: number, samples = 24): Point[] {
+export function sampleOffsetTurnCurve(turn: TurnSpec, q: number, samples = 24): Point[] {
   const sampleCount = Math.max(4, Math.floor(samples));
   const rQ = turn.radius - turn.sigma * q;
   if (rQ <= 1e-6) {
@@ -358,7 +358,7 @@ export function buildBoundaryPath(points: Point[], turns: Map<number, TurnSpec |
     const turn = turns.get(i) || null;
 
     if (turn) {
-      const curve = offsetTurnCurve(turn, q, samplesPerTurn);
+      const curve = sampleOffsetTurnCurve(turn, q, samplesPerTurn);
       if (curve.length >= 2) {
         if (distance(curve[0], out[out.length - 1]) < 1e-6) {
           out.push(...curve.slice(1));

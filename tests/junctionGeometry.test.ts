@@ -44,6 +44,23 @@ function hasSelfIntersection(points: Point[]): boolean {
   return false;
 }
 
+function polygonArea(points: Point[]): number {
+  const ring =
+    points.length > 1 &&
+    Math.abs(points[0].x - points[points.length - 1].x) < 1e-6 &&
+    Math.abs(points[0].y - points[points.length - 1].y) < 1e-6
+      ? points.slice(0, -1)
+      : points;
+
+  let area = 0;
+  for (let i = 0; i < ring.length; i += 1) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(area) / 2;
+}
+
 function sceneWithEdges(edges: RoadEdge[]): RoadPenScene {
   const nodes = [
     { id: "center", x: 0, y: 0 },
@@ -91,6 +108,22 @@ function tScene(): RoadPenScene {
   ]);
 }
 
+function angledTScene(): RoadPenScene {
+  return {
+    ...sceneWithEdges([
+      road("west-road", "center", "west", { x: 0, y: 0 }, { x: -120, y: 0 }),
+      road("east-road", "center", "east", { x: 0, y: 0 }, { x: 120, y: 0 }),
+      road("branch-road", "center", "branch", { x: 0, y: 0 }, { x: 70, y: -120 }),
+    ]),
+    nodes: [
+      { id: "center", x: 0, y: 0 },
+      { id: "west", x: -120, y: 0 },
+      { id: "east", x: 120, y: 0 },
+      { id: "branch", x: 70, y: -120 },
+    ],
+  };
+}
+
 function crossScene(): RoadPenScene {
   return sceneWithEdges([
     road("west-road", "center", "west", { x: 0, y: 0 }, { x: -120, y: 0 }),
@@ -121,6 +154,9 @@ describe("junctionGeometry", () => {
     expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "sidewalk")).toHaveLength(2);
     expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "clearance")).toHaveLength(2);
     expect(result.laneConnectorPatches.every((patch) => patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
+    expect(result.laneConnectorPatches.every((patch) => polygonArea(patch.polygon) > 20)).toBe(true);
+    expect(result.laneConnectorPatches.every((patch) => patch.polygon.length > 12)).toBe(true);
+    expect(result.laneConnectorPatches.every((patch) => !hasSelfIntersection(patch.polygon))).toBe(true);
   });
 
   test("四条道路共享节点时应识别为十字路口且补片不自交", () => {
@@ -131,6 +167,23 @@ describe("junctionGeometry", () => {
     expect(center).toMatchObject({ type: "cross", degree: 4 });
     expect(carriagewayPatch).toBeDefined();
     expect(hasSelfIntersection(carriagewayPatch?.polygon ?? [])).toBe(false);
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "facility")).toHaveLength(4);
+    expect(result.laneConnectorPatches.every((patch) => patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
+  });
+
+  test("斜角 T 路口也应生成有深度的同类 lane 角区 connector", () => {
+    const result = buildJunctionGeometry(angledTScene());
+    const facilityConnectors = result.laneConnectorPatches.filter(
+      (patch) => patch.nodeId === "center" && patch.baseLane === "facility",
+    );
+
+    expect(result.junctions.find((junction) => junction.nodeId === "center")).toMatchObject({ type: "t", degree: 3 });
+    expect(facilityConnectors).toHaveLength(2);
+    expect(facilityConnectors.every((patch) => polygonArea(patch.polygon) > 20)).toBe(true);
+    expect(facilityConnectors.every((patch) => patch.polygon.length > 12)).toBe(true);
+    expect(facilityConnectors.every((patch) => !hasSelfIntersection(patch.polygon))).toBe(true);
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "sidewalk")).toHaveLength(2);
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "clearance")).toHaveLength(2);
   });
 
   test("T 路口补片应让车行道合并为连续 polygon", () => {

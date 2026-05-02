@@ -19,6 +19,7 @@ interface RenderContext {
   draftPoints?: Point[];
   snapPreview?: SnapTarget | null;
   intersectionPreview?: Point[];
+  debugMode?: boolean;
 }
 
 export interface BandBucket {
@@ -32,15 +33,26 @@ export interface RoadBandData {
   junctionPatches: JunctionPatch[];
   laneConnectorPatches: LaneConnectorPatch[];
   edgeCenterlines: Array<{
-    edgeId: string;
+    id: string;
+    edgeIds: string[];
     geomType: string;
     rawPoints: Point[];
+    sourcePoints: Point[];
     renderPoints: Point[];
+    turns: Array<{
+      idx: number;
+      point: Point;
+      radius: number;
+      ell: number;
+      deltaDeg: number;
+    }>;
   }>;
   warnings: string[];
 }
 
 const EPS = 1e-9;
+const JUNCTION_EDGE_TRIM_MIN = 18;
+const JUNCTION_EDGE_TRIM_FACTOR = 1.45;
 const JUNCTION_STYLE: Record<
   JunctionType,
   { text: string; fill: string; fillText: string; stroke: string; border: string }
@@ -156,6 +168,114 @@ function endpointOutward(edge: RoadEdgeLike, atFrom: boolean): Point | null {
 }
 
 type RoadEdgeLike = RoadPenScene["edges"][number];
+type BranchSide = "left" | "right";
+type LaneBase = "facility" | "sidewalk" | "clearance";
+type EndpointKey = string;
+
+interface VisualChain {
+  id: string;
+  profileId: string;
+  edgeIds: string[];
+  nodeIds: string[];
+  points: Point[];
+  geomType: string;
+}
+
+interface ContinuationPair {
+  nodeId: string;
+  aEdgeId: string;
+  bEdgeId: string;
+}
+
+interface ChainBranch {
+  edge: RoadEdgeLike;
+  nodeId: string;
+  direction: Point;
+  profileId: string;
+}
+
+const PASS_THROUGH_DOT = -0.82;
+
+function laneBaseForBand(band: LaneBand): LaneBase | null {
+  if (band.id.startsWith("facility")) {
+    return "facility";
+  }
+  if (band.id.startsWith("sidewalk")) {
+    return "sidewalk";
+  }
+  if (band.id.startsWith("clearance")) {
+    return "clearance";
+  }
+  return null;
+}
+
+function trimKey(edgeId: string, nodeId: string, side: BranchSide, base: LaneBase): string {
+  return `${edgeId}:${nodeId}:${side}:${base}`;
+}
+
+function laneConnectorTrimMap(patches: LaneConnectorPatch[]): Set<string> {
+  const map = new Set<string>();
+  for (const patch of patches) {
+    map.add(trimKey(patch.fromEdgeId, patch.nodeId, "left", patch.baseLane));
+    map.add(trimKey(patch.toEdgeId, patch.nodeId, "right", patch.baseLane));
+  }
+  return map;
+}
+
+function bandSideAtEndpoint(edge: RoadEdgeLike, nodeId: string, band: LaneBand): BranchSide | null {
+  const isLeftBand = band.id.endsWith("_left");
+  const isRightBand = band.id.endsWith("_right");
+  if (!isLeftBand && !isRightBand) {
+    return null;
+  }
+
+  const edgeSide: BranchSide = isLeftBand ? "left" : "right";
+  if (nodeId === edge.from) {
+    return edgeSide;
+  }
+  if (nodeId === edge.to) {
+    return edgeSide === "left" ? "right" : "left";
+  }
+  return null;
+}
+
+function shouldTrimBandEndpoint(edge: RoadEdgeLike, nodeId: string, band: LaneBand, trimMap: Set<string>): boolean {
+  const branchSide = bandSideAtEndpoint(edge, nodeId, band);
+  const base = laneBaseForBand(band);
+  return branchSide && base ? trimMap.has(trimKey(edge.id, nodeId, branchSide, base)) : false;
+}
+
+function trimPolylineEndpoint(points: Point[], atStart: boolean, distancePx: number): Point[] {
+  if (points.length < 2 || distancePx <= EPS) {
+    return points;
+  }
+
+  const out = points.map((point) => ({ ...point }));
+  const index = atStart ? 0 : out.length - 1;
+  const neighborIndex = atStart ? 1 : out.length - 2;
+  const endpoint = out[index];
+  const neighbor = out[neighborIndex];
+  const vector = subPoint(neighbor, endpoint);
+  const length = Math.hypot(vector.x, vector.y);
+  if (length <= EPS) {
+    return out;
+  }
+
+  const inset = Math.min(distancePx, length * 0.45);
+  out[index] = addPoint(endpoint, scalePoint(vector, inset / length));
+  return out;
+}
+
+function trimPolylineForJunctions(points: Point[], trimStart: boolean, trimEnd: boolean, distancePx: number): Point[] {
+  let out = points.map((point) => ({ ...point }));
+  if (trimStart) {
+    out = trimPolylineEndpoint(out, true, distancePx);
+  }
+  if (trimEnd) {
+    out = trimPolylineEndpoint(out, false, distancePx);
+  }
+  return out;
+}
 
 function capBucketId(base: string, edgeId: string, nodeId: string): string {
   return `${base}_endcap_${edgeId}_${nodeId}`;
@@ -182,6 +302,239 @@ function addBandPolygon(bandBuckets: Map<string, BandBucket>, band: LaneBand, po
   const bucket = bandBuckets.get(bucketBand.id) ?? { band: bucketBand, polygons: [] };
   bandBuckets.set(bucketBand.id, bucket);
   bucket.polygons.push(polygon);
+}
+
+function dotPoint(a: Point, b: Point): number {
+  return a.x * b.x + a.y * b.y;
+}
+
+function endpointKey(edgeId: string, nodeId: string): EndpointKey {
+  return `${edgeId}::${nodeId}`;
+}
+
+function firstDirectionFromNode(edge: RoadEdgeLike, nodeId: string): Point | null {
+  const points = edge.controlPoints;
+  if (points.length < 2) {
+    return null;
+  }
+
+  if (edge.from === nodeId) {
+    return unitPoint(subPoint(points[1], points[0]));
+  }
+  if (edge.to === nodeId) {
+    return unitPoint(subPoint(points[points.length - 2], points[points.length - 1]));
+  }
+  return null;
+}
+
+function collectChainBranches(scene: RoadPenScene): Map<string, ChainBranch[]> {
+  const branches = new Map<string, ChainBranch[]>();
+
+  for (const edge of scene.edges) {
+    const fromDirection = firstDirectionFromNode(edge, edge.from);
+    if (fromDirection) {
+      const list = branches.get(edge.from) ?? [];
+      list.push({ edge, nodeId: edge.from, direction: fromDirection, profileId: edge.profileId });
+      branches.set(edge.from, list);
+    }
+
+    const toDirection = firstDirectionFromNode(edge, edge.to);
+    if (toDirection) {
+      const list = branches.get(edge.to) ?? [];
+      list.push({ edge, nodeId: edge.to, direction: toDirection, profileId: edge.profileId });
+      branches.set(edge.to, list);
+    }
+  }
+
+  return branches;
+}
+
+function buildContinuationPairs(scene: RoadPenScene): ContinuationPair[] {
+  const branchesByNode = collectChainBranches(scene);
+  const pairs: ContinuationPair[] = [];
+
+  for (const [nodeId, branches] of branchesByNode) {
+    if (branches.length < 2) {
+      continue;
+    }
+
+    const candidates: Array<{ a: ChainBranch; b: ChainBranch; dot: number }> = [];
+    for (let i = 0; i < branches.length; i += 1) {
+      for (let j = i + 1; j < branches.length; j += 1) {
+        const a = branches[i];
+        const b = branches[j];
+        if (a.profileId !== b.profileId) {
+          continue;
+        }
+        const dot = dotPoint(a.direction, b.direction);
+        if (dot <= PASS_THROUGH_DOT) {
+          candidates.push({ a, b, dot });
+        }
+      }
+    }
+
+    candidates.sort((a, b) => a.dot - b.dot);
+    const usedEdges = new Set<string>();
+    for (const candidate of candidates) {
+      if (usedEdges.has(candidate.a.edge.id) || usedEdges.has(candidate.b.edge.id)) {
+        continue;
+      }
+      usedEdges.add(candidate.a.edge.id);
+      usedEdges.add(candidate.b.edge.id);
+      pairs.push({ nodeId, aEdgeId: candidate.a.edge.id, bEdgeId: candidate.b.edge.id });
+    }
+  }
+
+  return pairs;
+}
+
+function otherNode(edge: RoadEdgeLike, nodeId: string): string {
+  return edge.from === nodeId ? edge.to : edge.from;
+}
+
+function orientedEdgePoints(edge: RoadEdgeLike, startNodeId: string): Point[] {
+  const points = edge.controlPoints.map((point) => ({ ...point }));
+  return edge.from === startNodeId ? points : points.reverse();
+}
+
+function appendChainPoints(out: Point[], points: Point[]): void {
+  for (const point of points) {
+    const last = out[out.length - 1];
+    if (last && distance(last, point) <= EPS) {
+      continue;
+    }
+    out.push({ ...point });
+  }
+}
+
+export function buildVisualChains(scene: RoadPenScene): {
+  chains: VisualChain[];
+  continuationPairs: ContinuationPair[];
+} {
+  const edgeMap = new Map(scene.edges.map((edge) => [edge.id, edge]));
+  const continuationPairs = buildContinuationPairs(scene);
+  const continuation = new Map<EndpointKey, EndpointKey>();
+
+  for (const pair of continuationPairs) {
+    const a = endpointKey(pair.aEdgeId, pair.nodeId);
+    const b = endpointKey(pair.bEdgeId, pair.nodeId);
+    continuation.set(a, b);
+    continuation.set(b, a);
+  }
+
+  const usedEdges = new Set<string>();
+  const chains: VisualChain[] = [];
+
+  function hasContinuation(edge: RoadEdgeLike, nodeId: string): boolean {
+    return continuation.has(endpointKey(edge.id, nodeId));
+  }
+
+  function walk(startEdge: RoadEdgeLike, startNodeId: string): VisualChain {
+    const edgeIds: string[] = [];
+    const nodeIds: string[] = [startNodeId];
+    const points: Point[] = [];
+    let currentEdge = startEdge;
+    let currentNodeId = startNodeId;
+
+    while (!usedEdges.has(currentEdge.id)) {
+      appendChainPoints(points, orientedEdgePoints(currentEdge, currentNodeId));
+      edgeIds.push(currentEdge.id);
+      usedEdges.add(currentEdge.id);
+
+      const exitNodeId = otherNode(currentEdge, currentNodeId);
+      nodeIds.push(exitNodeId);
+      const nextEndpoint = continuation.get(endpointKey(currentEdge.id, exitNodeId));
+      if (!nextEndpoint) {
+        break;
+      }
+
+      const [nextEdgeId] = nextEndpoint.split("::");
+      const nextEdge = edgeMap.get(nextEdgeId);
+      if (!nextEdge || usedEdges.has(nextEdge.id)) {
+        break;
+      }
+
+      currentEdge = nextEdge;
+      currentNodeId = exitNodeId;
+    }
+
+    return {
+      id: `vc-${chains.length + 1}`,
+      profileId: startEdge.profileId,
+      edgeIds,
+      nodeIds,
+      points,
+      geomType: points.length > 2 ? "spline" : "polyline",
+    };
+  }
+
+  for (const edge of scene.edges) {
+    if (usedEdges.has(edge.id)) {
+      continue;
+    }
+    const startAtFrom = !hasContinuation(edge, edge.from);
+    const startAtTo = !hasContinuation(edge, edge.to);
+    if (!startAtFrom && !startAtTo) {
+      continue;
+    }
+    chains.push(walk(edge, startAtFrom ? edge.from : edge.to));
+  }
+
+  for (const edge of scene.edges) {
+    if (!usedEdges.has(edge.id)) {
+      chains.push(walk(edge, edge.from));
+    }
+  }
+
+  return { chains, continuationPairs };
+}
+
+function removePassThroughJunctionPoints(
+  points: Point[],
+  chain: VisualChain,
+  nodeMap: Map<string, SceneNode>,
+  degrees: Map<string, number>,
+): Point[] {
+  if (points.length < 3 || chain.nodeIds.length < 3) {
+    return points.map((point) => ({ ...point }));
+  }
+
+  const passThroughNodes = new Set(
+    chain.nodeIds
+      .slice(1, -1)
+      .filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3)
+      .map((nodeId) => {
+        const node = nodeMap.get(nodeId);
+        return node ? `${node.x.toFixed(6)},${node.y.toFixed(6)}` : "";
+      })
+      .filter(Boolean),
+  );
+
+  if (passThroughNodes.size === 0) {
+    return points.map((point) => ({ ...point }));
+  }
+
+  const out: Point[] = [];
+  for (let i = 0; i < points.length; i += 1) {
+    const point = points[i];
+    const key = `${point.x.toFixed(6)},${point.y.toFixed(6)}`;
+    const canRemove = i > 0 && i < points.length - 1 && passThroughNodes.has(key);
+    if (!canRemove) {
+      out.push({ ...point });
+      continue;
+    }
+
+    const prev = points[i - 1];
+    const next = points[i + 1];
+    const incoming = unitPoint(subPoint(point, prev));
+    const outgoing = unitPoint(subPoint(next, point));
+    if (!incoming || !outgoing || dotPoint(incoming, outgoing) < Math.abs(PASS_THROUGH_DOT)) {
+      out.push({ ...point });
+      continue;
+    }
+  }
+
+  return out.length >= 2 ? out : points.map((point) => ({ ...point }));
 }
 
 function addDeadEndCaps(
@@ -272,12 +625,20 @@ function drawRing(ctx: CanvasRenderingContext2D, ring: Point[]): void {
     return;
   }
   const p0 = ring[0];
-  ctx.beginPath();
   ctx.moveTo(p0.x, p0.y);
   for (let i = 1; i < ring.length; i += 1) {
     ctx.lineTo(ring[i].x, ring[i].y);
   }
   ctx.closePath();
+}
+
+function drawRingSet(ctx: CanvasRenderingContext2D, ringSet: Point[][]): void {
+  ctx.beginPath();
+  for (const ring of ringSet) {
+    if (ring.length >= 3 && Math.abs(polygonArea(ring)) >= 1e-6) {
+      drawRing(ctx, ring);
+    }
+  }
 }
 
 function drawJunctionMarker(ctx: CanvasRenderingContext2D, junction: JunctionAnalysis): void {
@@ -412,8 +773,139 @@ function drawIntersectionPreview(ctx: CanvasRenderingContext2D, points: Point[] 
   ctx.restore();
 }
 
+function drawDebugPolyline(ctx: CanvasRenderingContext2D, points: Point[], color: string, dash: number[] = []): void {
+  if (points.length < 2) {
+    return;
+  }
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (const point of points.slice(1)) {
+    ctx.lineTo(point.x, point.y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDebugPolygon(ctx: CanvasRenderingContext2D, polygon: Point[], color: string, dash: number[] = []): void {
+  if (polygon.length < 3) {
+    return;
+  }
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  ctx.moveTo(polygon[0].x, polygon[0].y);
+  for (const point of polygon.slice(1)) {
+    ctx.lineTo(point.x, point.y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDebugLabel(ctx: CanvasRenderingContext2D, text: string, point: Point, color = "#f8fafc"): void {
+  ctx.save();
+  ctx.font = "10px 'Figtree', 'PingFang SC', sans-serif";
+  ctx.textBaseline = "top";
+  const lines = text.split("\n");
+  const width = Math.max(...lines.map((line) => ctx.measureText(line).width)) + 8;
+  const height = lines.length * 12 + 6;
+  ctx.fillStyle = "rgba(8, 13, 28, 0.82)";
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.55)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(point.x + 6, point.y + 6, width, height, 5);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = color;
+  lines.forEach((line, index) => {
+    ctx.fillText(line, point.x + 10, point.y + 9 + index * 12);
+  });
+  ctx.restore();
+}
+
+function drawDebugOverlay(ctx: CanvasRenderingContext2D, data: RoadBandData): void {
+  ctx.save();
+  ctx.globalAlpha = 0.92;
+
+  for (const patch of data.junctionPatches) {
+    drawDebugPolygon(ctx, patch.polygon, patch.kind === "mouth" ? "#fb923c" : "#facc15", patch.kind === "mouth" ? [2, 2] : [5, 3]);
+  }
+
+  for (const patch of data.laneConnectorPatches) {
+    drawDebugPolygon(ctx, patch.polygon, "#22c55e", [3, 3]);
+  }
+
+  for (const chain of data.edgeCenterlines) {
+    drawDebugPolyline(ctx, chain.rawPoints, "#ef4444", [7, 4]);
+    drawDebugPolyline(ctx, chain.sourcePoints, "#facc15", [3, 3]);
+    drawDebugPolyline(ctx, chain.renderPoints, "#38bdf8");
+
+    chain.rawPoints.forEach((point, index) => {
+      ctx.beginPath();
+      ctx.fillStyle = "#f97316";
+      ctx.strokeStyle = "#fff7ed";
+      ctx.lineWidth = 1;
+      ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      drawDebugLabel(ctx, `${chain.id} raw p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}`, point, "#fed7aa");
+    });
+
+    chain.sourcePoints.forEach((point, index) => {
+      const turn = chain.turns.find((item) => item.idx === index);
+      if (!turn) {
+        return;
+      }
+      ctx.beginPath();
+      ctx.fillStyle = "#facc15";
+      ctx.strokeStyle = "#fff7ed";
+      ctx.lineWidth = 1;
+      ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      drawDebugLabel(
+        ctx,
+        `${chain.id} turn p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}\nr=${turn.radius.toFixed(1)} ell=${turn.ell.toFixed(1)} d=${turn.deltaDeg.toFixed(0)}`,
+        point,
+        "#fde68a",
+      );
+    });
+
+    if (chain.rawPoints.length > 0) {
+      drawDebugLabel(ctx, `${chain.id}\nedges=${chain.edgeIds.join("+")}\nraw red / source yellow / render cyan`, chain.rawPoints[0], "#bae6fd");
+    }
+  }
+
+  for (const junction of data.junctions) {
+    if (junction.degree < 3) {
+      continue;
+    }
+    ctx.beginPath();
+    ctx.strokeStyle = junction.type === "cross" ? "#fb923c" : "#e879f9";
+    ctx.lineWidth = 1.5;
+    ctx.arc(junction.point.x, junction.point.y, 16, 0, Math.PI * 2);
+    ctx.stroke();
+
+    for (const branch of junction.branches) {
+      const end = addPoint(junction.point, scalePoint(branch.direction, 34));
+      drawDebugPolyline(ctx, [junction.point, end], "#a78bfa", [2, 3]);
+      drawDebugLabel(ctx, branch.edgeId, end, "#ddd6fe");
+    }
+  }
+
+  ctx.restore();
+}
+
 export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   const nodeMap = indexNodes(scene);
+  const degrees = nodeDegreeMap(scene);
   const bandBuckets = new Map<string, BandBucket>();
   const edgeCenterlines: RoadBandData["edgeCenterlines"] = [];
   const warnings = new Set<string>();
@@ -428,64 +920,75 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     });
   }
 
-  for (const edge of scene.edges) {
-    const profile = profileMap.get(edge.profileId) ?? profileMap.get("default");
+  const junctionGeometry = buildJunctionGeometry(scene, profileMap);
+  const { chains: visualChains } = buildVisualChains(scene);
+  for (const warning of junctionGeometry.warnings) {
+    warnings.add(warning);
+  }
+
+  for (const chain of visualChains) {
+    const profile = profileMap.get(chain.profileId) ?? profileMap.get("default");
     if (!profile) {
       continue;
     }
 
-    const from = nodeMap.get(edge.from);
-    const to = nodeMap.get(edge.to);
-    if (!from || !to) {
+    if (chain.points.length < 2) {
       continue;
     }
 
-    const bands = buildLaneBandsForProfile(edge.profileId, profileMap);
+    const bands = buildLaneBandsForProfile(chain.profileId, profileMap);
     if (bands.length === 0) {
       continue;
     }
 
     const maxOffset = Math.max(...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
-    const isSpline = edge.geomType === "spline";
-    const rawCenterline = edge.controlPoints.map((p) => ({ ...p }));
+    const rawCenterline = chain.points.map((p) => ({ ...p }));
+    const sourceCenterline = removePassThroughJunctionPoints(rawCenterline, chain, nodeMap, degrees);
     const splineTurnOptions = {
       angleThresholdDeg: 6,
       radiusFactor: 2.2,
       clampRatio: 0.45,
       minInnerRadius: 0.4,
     };
-    const centerline = isSpline
-      ? buildSkeletonPathByPoints(rawCenterline, maxOffset, {
-          samplesPerTurn: 20,
-          turnOptions: splineTurnOptions,
-        })
-      : rawCenterline;
+    const usesSmoothCenterline = sourceCenterline.length > 2;
+    const turns = computeTurnSpecs(sourceCenterline, maxOffset, splineTurnOptions);
+    const centerline =
+      usesSmoothCenterline
+        ? buildSkeletonPathByPoints(sourceCenterline, maxOffset, {
+            samplesPerTurn: 20,
+            turnOptions: splineTurnOptions,
+          })
+        : sourceCenterline;
     edgeCenterlines.push({
-      edgeId: edge.id,
-      geomType: edge.geomType,
+      id: chain.id,
+      edgeIds: chain.edgeIds,
+      geomType: chain.geomType,
       rawPoints: rawCenterline.map((point) => ({ ...point })),
+      sourcePoints: sourceCenterline.map((point) => ({ ...point })),
       renderPoints: centerline.map((point) => ({ ...point })),
+      turns: [...turns.entries()].flatMap(([idx, turn]) =>
+        turn
+          ? [{
+          idx,
+          point: { ...sourceCenterline[idx] },
+          radius: turn.radius,
+          ell: turn.ell,
+          deltaDeg: (turn.delta * 180) / Math.PI,
+        }]
+          : [],
+      ),
     });
-
-    const turns = isSpline
-      ? new Map()
-      : computeTurnSpecs(centerline, maxOffset, {
-          angleThresholdDeg: 6,
-          radiusFactor: 2.2,
-          clampRatio: 0.45,
-          minInnerRadius: 0.4,
-        });
 
     for (const turn of turns.values()) {
       if (turn?.warning) {
-        warnings.add(`道路 ${edge.id}：${turn.warning}`);
+        warnings.add(`道路 ${chain.edgeIds.join("+")}：${turn.warning}`);
       }
     }
 
     for (const band of bands) {
-      const polygon = isSpline
+      const polygon = usesSmoothCenterline
         ? buildSmoothBandPolygon(centerline, band.qInner, band.qOuter)
-        : buildBandPolygon(centerline, turns, band.qInner, band.qOuter, {
+        : buildBandPolygon(sourceCenterline, turns, band.qInner, band.qOuter, {
             samplesPerTurn: 20,
           });
       if (polygon.length < 3) {
@@ -496,11 +999,6 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   }
 
   addDeadEndCaps(scene, nodeMap, profileMap, bandBuckets);
-
-  const junctionGeometry = buildJunctionGeometry(scene, profileMap);
-  for (const warning of junctionGeometry.warnings) {
-    warnings.add(warning);
-  }
 
   for (const patch of junctionGeometry.patches) {
     addBandPolygon(bandBuckets, patch.band, patch.polygon);
@@ -537,10 +1035,11 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     return [];
   }
 
-  const { width, height, draftPoints, snapPreview, intersectionPreview } = params;
+  const { width, height, draftPoints, snapPreview, intersectionPreview, debugMode } = params;
   ctx.clearRect(0, 0, width, height);
 
-  const { bandBuckets, junctions, warnings: geometryWarnings } = buildRoadBandPolygons(scene);
+  const roadData = buildRoadBandPolygons(scene);
+  const { bandBuckets, junctions, warnings: geometryWarnings } = roadData;
   const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   for (const bucket of orderedBands) {
@@ -548,27 +1047,23 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     const rings = multiPolygonToRings(merged);
 
     for (const ringSet of rings) {
-      for (const ring of ringSet) {
-        if (ring.length < 3) {
-          continue;
-        }
-
-        const signedArea = polygonArea(ring);
-        if (Math.abs(signedArea) < 1e-6) {
-          continue;
-        }
-
-        ctx.fillStyle = bucket.band.color;
-        ctx.strokeStyle = "rgba(8, 14, 29, 0.8)";
-        ctx.lineWidth = 1;
-        drawRing(ctx, ring);
-        ctx.fill();
-        ctx.stroke();
+      if (ringSet.length === 0) {
+        continue;
       }
+
+      ctx.fillStyle = bucket.band.color;
+      ctx.strokeStyle = "rgba(8, 14, 29, 0.8)";
+      ctx.lineWidth = 1;
+      drawRingSet(ctx, ringSet);
+      ctx.fill("evenodd");
+      ctx.stroke();
     }
   }
 
   drawJunctionLabels(ctx, junctions);
+  if (debugMode) {
+    drawDebugOverlay(ctx, roadData);
+  }
   drawSnapPreview(ctx, scene, snapPreview);
   drawIntersectionPreview(ctx, intersectionPreview);
 

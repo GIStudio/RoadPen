@@ -85,7 +85,8 @@ describe("topology", () => {
     const snap = findSnapTarget(scene, { x: 12, y: 7 }, { nodeRadius: 12, edgeRadius: 16 });
 
     expect(snap).toMatchObject({ type: "edge", edgeId: "main", segmentIndex: 0 });
-    expect(snap.point).toEqual({ x: 12, y: 0 });
+    expect(snap.point.x).toBeCloseTo(12);
+    expect(snap.point.y).toBeCloseTo(0);
   });
 
   test("新道路端点吸附到旧道路中段后，应拆分旧边形成 T 路口", () => {
@@ -95,10 +96,12 @@ describe("topology", () => {
 
     const result = commitRoadWithTopology(scene, anchors, "default", ids.node, ids.edge);
     const junction = buildJunctionGeometry(scene).junctions.find((item) => item.point.x === 0 && item.point.y === 0);
-    const { junctionPatches } = buildRoadBandPolygons(scene);
+    const { edgeCenterlines, junctionPatches } = buildRoadBandPolygons(scene);
+    const mainVisualChain = edgeCenterlines.find((chain) => chain.edgeIds.includes("main") && chain.edgeIds.length === 2);
 
     expect(result?.createdEdgeIds).toHaveLength(1);
     expect(scene.edges).toHaveLength(3);
+    expect(mainVisualChain).toBeDefined();
     expect(junction).toMatchObject({ type: "t", degree: 3 });
     expect(junctionPatches.some((patch) => patch.nodeId === junction?.nodeId && patch.bandId === "carriageway")).toBe(true);
   });

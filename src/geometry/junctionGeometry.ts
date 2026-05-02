@@ -1,5 +1,5 @@
-import type { JunctionType, LaneBand, Point, RoadEdge, RoadPenScene, SceneNode } from "../types";
-import { buildLaneBandsForProfile, distance } from "./roadGeometry";
+import type { JunctionType, LaneBand, Point, RoadEdge, RoadPenScene, SceneNode, TurnSpec } from "../types";
+import { buildLaneBandsForProfile, distance, sampleOffsetTurnCurve } from "./roadGeometry";
 
 export interface JunctionBranch {
   edgeId: string;
@@ -19,6 +19,7 @@ export interface JunctionPatch {
   nodeId: string;
   type: JunctionType;
   bandId: string;
+  kind?: "mouth" | "turn";
   band: LaneBand;
   polygon: Point[];
 }
@@ -44,6 +45,10 @@ type ProfileMap = Map<string, { carriagewayWidth: number; facilityWidth: number;
 const EPS = 1e-9;
 const MIN_BRANCH_LENGTH = 1e-4;
 const DUPLICATE_DIRECTION_DOT = 0.985;
+const JUNCTION_LANE_MIN_TURN_RADIUS = 10;
+const JUNCTION_LANE_RADIUS_FACTOR = 2.2;
+const JUNCTION_LANE_CURVE_SAMPLES = 18;
+const PASS_THROUGH_DOT = -0.82;
 
 function add(a: Point, b: Point): Point {
   return { x: a.x + b.x, y: a.y + b.y };
@@ -55,6 +60,10 @@ function sub(a: Point, b: Point): Point {
 
 function scale(point: Point, value: number): Point {
   return { x: point.x * value, y: point.y * value };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function normalize(point: Point): Point | null {
@@ -71,6 +80,10 @@ function leftNormal(direction: Point): Point {
 
 function dot(a: Point, b: Point): number {
   return a.x * b.x + a.y * b.y;
+}
+
+function crossVec(a: Point, b: Point): number {
+  return a.x * b.y - a.y * b.x;
 }
 
 function cross(a: Point, b: Point, c: Point): number {
@@ -177,7 +190,26 @@ function convexHull(points: Point[]): Point[] {
 
 function patchRadiusForBand(band: LaneBand): number {
   const maxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
-  return Math.max(18, maxOffset * 1.45);
+  return Math.max(14, maxOffset * 1.05);
+}
+
+function buildCarriagewayConnectorPolygon(point: Point, aDir: Point, aBand: LaneBand, bDir: Point, bBand: LaneBand): Point[] {
+  const turn = buildVirtualLaneTurn(point, aDir, bDir, aBand, bBand);
+  if (!turn) {
+    return [];
+  }
+
+  const outerQ = virtualLaneBoundaryQ(aBand.qOuter, bBand.qInner);
+  const innerQ = virtualLaneBoundaryQ(aBand.qInner, bBand.qOuter);
+  const outerCurve = sampleOffsetTurnCurve(turn, outerQ, JUNCTION_LANE_CURVE_SAMPLES);
+  const innerCurve = sampleOffsetTurnCurve(turn, innerQ, JUNCTION_LANE_CURVE_SAMPLES);
+  if (outerCurve.length < 4 || innerCurve.length < 4) {
+    return [];
+  }
+
+  const polygon = [...outerCurve, ...innerCurve.reverse()];
+  polygon.push({ ...polygon[0] });
+  return polygon;
 }
 
 function buildCarriagewayPatchForBand(
@@ -214,6 +246,70 @@ function buildCarriagewayPatchForBand(
     band: { ...referenceBand },
     polygon,
   };
+}
+
+function buildCarriagewayConnectorPatches(analysis: JunctionAnalysis, branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>): JunctionPatch[] {
+  const branches = sortedBranches(branchBands.map((item) => item.branch));
+  const bandByEdge = new Map(branchBands.map((item) => [item.branch.edgeId, item.band]));
+  const passThrough = passThroughPairs(branches);
+  const patches: JunctionPatch[] = [];
+
+  for (let i = 0; i < branches.length; i += 1) {
+    const a = branches[i];
+    const b = branches[(i + 1) % branches.length];
+    if (passThrough.has(branchPairKey(a, b)) || !canBuildCollisionCorner(a, b)) {
+      continue;
+    }
+
+    const aBand = bandByEdge.get(a.edgeId);
+    const bBand = bandByEdge.get(b.edgeId);
+    if (!aBand || !bBand) {
+      continue;
+    }
+
+    const polygon = buildCarriagewayConnectorPolygon(analysis.point, a.direction, aBand, b.direction, bBand);
+    if (polygon.length < 4) {
+      continue;
+    }
+
+    patches.push({
+      nodeId: analysis.nodeId,
+      type: analysis.type,
+      bandId: "carriageway",
+      kind: "turn",
+      band: { ...aBand },
+      polygon,
+    });
+  }
+
+  return patches;
+}
+
+function buildCarriagewayMouthPatches(analysis: JunctionAnalysis, branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>): JunctionPatch[] {
+  return branchBands.flatMap(({ branch, band }) => {
+    const normal = leftNormal(branch.direction);
+    const maxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
+    const depth = Math.max(18, maxOffset * 1.5);
+    const mouthCenter = add(analysis.point, scale(branch.direction, depth));
+    const polygon = [
+      add(analysis.point, scale(normal, band.qInner)),
+      add(mouthCenter, scale(normal, band.qInner)),
+      add(mouthCenter, scale(normal, band.qOuter)),
+      add(analysis.point, scale(normal, band.qOuter)),
+    ];
+    polygon.push({ ...polygon[0] });
+
+    return [
+      {
+        nodeId: analysis.nodeId,
+        type: analysis.type,
+        bandId: "carriageway",
+        kind: "mouth" as const,
+        band: { ...band },
+        polygon,
+      },
+    ];
+  });
 }
 
 function bandBaseId(id: string): "facility" | "sidewalk" | "clearance" | null {
@@ -333,21 +429,118 @@ function offsetCornerBoundary(point: Point, aDir: Point, aQ: number, bDir: Point
   return arc.length > 0 ? arc : quadraticPoints(start, control, end, 10);
 }
 
-function buildLaneConnectorPolygon(point: Point, aDir: Point, aLeft: LaneBand, bDir: Point, bRight: LaneBand): Point[] {
-  const aNormal = leftNormal(aDir);
-  const bNormal = leftNormal(bDir);
-  const polygon = [
-    add(point, scale(aNormal, aLeft.qInner)),
-    add(point, scale(bNormal, bRight.qOuter)),
-    add(point, scale(bNormal, bRight.qInner)),
-    add(point, scale(aNormal, aLeft.qOuter)),
-  ];
-  const first = polygon[0];
-  const last = polygon[polygon.length - 1];
-  if (Math.abs(first.x - last.x) > 1e-6 || Math.abs(first.y - last.y) > 1e-6) {
-    polygon.push({ ...first });
+function boundaryPoint(point: Point, direction: Point, q: number): Point {
+  return add(point, scale(leftNormal(direction), q));
+}
+
+function projectPointToLine(point: Point, linePoint: Point, lineDirection: Point): Point {
+  return add(linePoint, scale(lineDirection, dot(sub(point, linePoint), lineDirection)));
+}
+
+function connectorDepth(aLeft: LaneBand, bRight: LaneBand): number {
+  const maxOffset = Math.max(
+    Math.abs(aLeft.qInner),
+    Math.abs(aLeft.qOuter),
+    Math.abs(bRight.qInner),
+    Math.abs(bRight.qOuter),
+  );
+  return clamp(maxOffset * 1.5, 18, 42);
+}
+
+function virtualLaneBoundaryQ(leftQ: number, rightQ: number): number {
+  return (-leftQ + rightQ) / 2;
+}
+
+function buildVirtualLaneTurn(point: Point, aDir: Point, bDir: Point, aReference: LaneBand, bReference: LaneBand): TurnSpec | null {
+  const u = scale(aDir, -1);
+  const v = bDir;
+  const dotValue = clamp(dot(u, v), -1, 1);
+  const delta = Math.acos(dotValue);
+  const cr = crossVec(u, v);
+  if (delta <= Math.PI / 36 || Math.abs(cr) <= EPS) {
+    return null;
   }
+
+  const maxOffset = Math.max(
+    Math.abs(aReference.qInner),
+    Math.abs(aReference.qOuter),
+    Math.abs(bReference.qInner),
+    Math.abs(bReference.qOuter),
+  );
+  const minRadius = maxOffset + JUNCTION_LANE_MIN_TURN_RADIUS * 0.5;
+  const desiredRadius = Math.max(maxOffset * 2 * JUNCTION_LANE_RADIUS_FACTOR, JUNCTION_LANE_MIN_TURN_RADIUS);
+  const desiredEll = desiredRadius * Math.tan(delta / 2);
+  const mouthLimit = connectorDepth(aReference, bReference);
+  const minEll = minRadius * Math.tan(delta / 2);
+  const ell = clamp(desiredEll, Math.max(JUNCTION_LANE_MIN_TURN_RADIUS * 0.6, minEll), Math.max(mouthLimit, minEll));
+  const radius = Math.max(ell / Math.tan(delta / 2), JUNCTION_LANE_MIN_TURN_RADIUS);
+
+  return {
+    idx: 0,
+    u,
+    v,
+    a: add(point, scale(aDir, ell)),
+    b: add(point, scale(bDir, ell)),
+    delta,
+    sigma: cr >= 0 ? 1 : -1,
+    radius,
+    ell,
+    warning: undefined,
+  };
+}
+
+function buildLaneConnectorPolygon(
+  point: Point,
+  aDir: Point,
+  aLeft: LaneBand,
+  bDir: Point,
+  bRight: LaneBand,
+  aReference: LaneBand,
+  bReference: LaneBand,
+): Point[] {
+  const turn = buildVirtualLaneTurn(point, aDir, bDir, aReference, bReference);
+  if (!turn) {
+    return [];
+  }
+
+  const outerQ = virtualLaneBoundaryQ(aLeft.qOuter, bRight.qInner);
+  const innerQ = virtualLaneBoundaryQ(aLeft.qInner, bRight.qOuter);
+  const outerCurve = sampleOffsetTurnCurve(turn, outerQ, JUNCTION_LANE_CURVE_SAMPLES);
+  const innerCurve = sampleOffsetTurnCurve(turn, innerQ, JUNCTION_LANE_CURVE_SAMPLES);
+  if (outerCurve.length < 4 || innerCurve.length < 4) {
+    return [];
+  }
+
+  const polygon = [...outerCurve, ...innerCurve.reverse()];
+  polygon.push({ ...polygon[0] });
   return polygon;
+}
+
+function carriagewayHalfWidth(profileMap: ProfileMap, a: JunctionBranch, b: JunctionBranch): number {
+  const aBand = branchBand(profileMap, a, "carriageway");
+  const bBand = branchBand(profileMap, b, "carriageway");
+  return Math.max(
+    Math.abs(aBand?.qInner ?? 0),
+    Math.abs(aBand?.qOuter ?? 0),
+    Math.abs(bBand?.qInner ?? 0),
+    Math.abs(bBand?.qOuter ?? 0),
+  );
+}
+
+function laneConnectorStaysOutsideCarriagewayCenter(point: Point, polygon: Point[], profileMap: ProfileMap, a: JunctionBranch, b: JunctionBranch): boolean {
+  const minDistance = carriagewayHalfWidth(profileMap, a, b) * 0.95;
+  return polygon.every((item) => distance(point, item) >= minDistance);
+}
+
+function outerReferenceBand(profileMap: ProfileMap, branch: JunctionBranch, side: "left" | "right"): LaneBand | null {
+  const bases: Array<"clearance" | "sidewalk" | "facility"> = ["clearance", "sidewalk", "facility"];
+  for (const base of bases) {
+    const band = branchBand(profileMap, branch, `${base}_${side}`);
+    if (band && Math.abs(band.qOuter - band.qInner) > 1e-6) {
+      return band;
+    }
+  }
+  return null;
 }
 
 function sortedBranches(branches: JunctionBranch[]): JunctionBranch[] {
@@ -381,19 +574,67 @@ function canBuildCollisionCorner(a: JunctionBranch, b: JunctionBranch): boolean 
   return gapDot > -0.707 && gapDot < 0.985;
 }
 
+function branchPairKey(a: JunctionBranch, b: JunctionBranch): string {
+  return [a.edgeId, b.edgeId].sort().join("::");
+}
+
+function passThroughPairs(branches: JunctionBranch[]): Set<string> {
+  const candidates: Array<{ a: JunctionBranch; b: JunctionBranch; dot: number }> = [];
+  for (let i = 0; i < branches.length; i += 1) {
+    for (let j = i + 1; j < branches.length; j += 1) {
+      const a = branches[i];
+      const b = branches[j];
+      if (a.profileId !== b.profileId) {
+        continue;
+      }
+      const value = dot(a.direction, b.direction);
+      if (value <= PASS_THROUGH_DOT) {
+        candidates.push({ a, b, dot: value });
+      }
+    }
+  }
+
+  candidates.sort((a, b) => a.dot - b.dot);
+  const used = new Set<string>();
+  const pairs = new Set<string>();
+  for (const candidate of candidates) {
+    if (used.has(candidate.a.edgeId) || used.has(candidate.b.edgeId)) {
+      continue;
+    }
+    used.add(candidate.a.edgeId);
+    used.add(candidate.b.edgeId);
+    pairs.add(branchPairKey(candidate.a, candidate.b));
+  }
+  return pairs;
+}
+
 function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: ProfileMap): LaneConnectorPatch[] {
   if (analysis.degree < 3) {
     return [];
   }
 
   const branches = sortedBranches(analysis.branches);
+  const passThrough = passThroughPairs(branches);
   const bases: Array<"facility" | "sidewalk" | "clearance"> = ["facility", "sidewalk", "clearance"];
   const patches: LaneConnectorPatch[] = [];
 
-  for (const base of bases) {
-    for (let i = 0; i < branches.length; i += 1) {
-      const a = branches[i];
-      const b = branches[(i + 1) % branches.length];
+  for (let i = 0; i < branches.length; i += 1) {
+    const a = branches[i];
+    const b = branches[(i + 1) % branches.length];
+    if (passThrough.has(branchPairKey(a, b))) {
+      continue;
+    }
+    if (!canBuildCollisionCorner(a, b)) {
+      continue;
+    }
+
+    const aReference = outerReferenceBand(profileMap, a, "left");
+    const bReference = outerReferenceBand(profileMap, b, "right");
+    if (!aReference || !bReference) {
+      continue;
+    }
+
+    for (const base of bases) {
       const aLeft = branchBand(profileMap, a, `${base}_left`);
       const bRight = branchBand(profileMap, b, `${base}_right`);
       if (!aLeft || !bRight) {
@@ -404,12 +645,11 @@ function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: Profi
         continue;
       }
 
-      if (!canBuildCollisionCorner(a, b)) {
+      const polygon = buildLaneConnectorPolygon(analysis.point, a.direction, aLeft, b.direction, bRight, aReference, bReference);
+      if (polygon.length < 4) {
         continue;
       }
-
-      const polygon = buildLaneConnectorPolygon(analysis.point, a.direction, aLeft, b.direction, bRight);
-      if (polygon.length < 4) {
+      if (!laneConnectorStaysOutsideCarriagewayCenter(analysis.point, polygon, profileMap, a, b)) {
         continue;
       }
 
@@ -448,10 +688,8 @@ function buildPatchesForJunction(analysis: JunctionAnalysis, profileMap: Profile
     if (bandId !== "carriageway") {
       continue;
     }
-    const patch = buildCarriagewayPatchForBand(analysis, bandId, branchBands);
-    if (patch) {
-      patches.push(patch);
-    }
+    patches.push(...buildCarriagewayMouthPatches(analysis, branchBands));
+    patches.push(...buildCarriagewayConnectorPatches(analysis, branchBands));
   }
 
   return patches;
