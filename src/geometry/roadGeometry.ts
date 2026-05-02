@@ -164,7 +164,7 @@ export function profileToBands(profile: {
       qInner: -halfRoad,
       qOuter: halfRoad,
       color: "rgb(45, 55, 72)",
-      zIndex: 50,
+      zIndex: 5,
     },
     {
       id: "facility_left",

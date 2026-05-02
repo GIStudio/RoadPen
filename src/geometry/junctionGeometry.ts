@@ -19,7 +19,7 @@ export interface JunctionPatch {
   nodeId: string;
   type: JunctionType;
   bandId: string;
-  kind?: "mouth" | "turn";
+  kind?: "mouth" | "turn" | "center";
   band: LaneBand;
   polygon: Point[];
 }
@@ -193,6 +193,20 @@ function patchRadiusForBand(band: LaneBand): number {
   return Math.max(14, maxOffset * 1.05);
 }
 
+function maxProfileOffset(profileMap: ProfileMap, profileId: string): number {
+  const bands = buildLaneBandsForProfile(profileId, profileMap);
+  return Math.max(
+    0,
+    ...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))),
+  );
+}
+
+function carriagewayJunctionDepthForBranch(profileMap: ProfileMap, branch: JunctionBranch, band: LaneBand): number {
+  const carriagewayOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
+  const profileOffset = maxProfileOffset(profileMap, branch.profileId);
+  return Math.max(30, carriagewayOffset * 2.4, profileOffset * 1.35);
+}
+
 function buildCarriagewayConnectorPolygon(point: Point, aDir: Point, aBand: LaneBand, bDir: Point, bBand: LaneBand): Point[] {
   const turn = buildVirtualLaneTurn(point, aDir, bDir, aBand, bBand);
   if (!turn) {
@@ -285,11 +299,14 @@ function buildCarriagewayConnectorPatches(analysis: JunctionAnalysis, branchBand
   return patches;
 }
 
-function buildCarriagewayMouthPatches(analysis: JunctionAnalysis, branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>): JunctionPatch[] {
+function buildCarriagewayMouthPatches(
+  analysis: JunctionAnalysis,
+  profileMap: ProfileMap,
+  branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>,
+): JunctionPatch[] {
   return branchBands.flatMap(({ branch, band }) => {
     const normal = leftNormal(branch.direction);
-    const maxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
-    const depth = Math.max(18, maxOffset * 1.5);
+    const depth = carriagewayJunctionDepthForBranch(profileMap, branch, band);
     const mouthCenter = add(analysis.point, scale(branch.direction, depth));
     const polygon = [
       add(analysis.point, scale(normal, band.qInner)),
@@ -310,6 +327,46 @@ function buildCarriagewayMouthPatches(analysis: JunctionAnalysis, branchBands: A
       },
     ];
   });
+}
+
+function buildCarriagewayCenterEnvelopePatch(
+  analysis: JunctionAnalysis,
+  profileMap: ProfileMap,
+  branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>,
+): JunctionPatch | null {
+  if (branchBands.length < 3) {
+    return null;
+  }
+
+  const referenceBand = branchBands[0].band;
+  const boundaryPoints = branchBands.flatMap(({ branch, band }) => {
+    const normal = leftNormal(branch.direction);
+    const depth = carriagewayJunctionDepthForBranch(profileMap, branch, band);
+    const mouthCenter = add(analysis.point, scale(branch.direction, depth));
+    return [add(mouthCenter, scale(normal, band.qInner)), add(mouthCenter, scale(normal, band.qOuter))];
+  });
+
+  const polygon = boundaryPoints
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+    .sort(
+      (a, b) =>
+        Math.atan2(a.y - analysis.point.y, a.x - analysis.point.x) -
+        Math.atan2(b.y - analysis.point.y, b.x - analysis.point.x),
+    );
+
+  if (polygon.length < 3) {
+    return null;
+  }
+
+  polygon.push({ ...polygon[0] });
+  return {
+    nodeId: analysis.nodeId,
+    type: analysis.type,
+    bandId: "carriageway",
+    kind: "center",
+    band: { ...referenceBand },
+    polygon,
+  };
 }
 
 function bandBaseId(id: string): "facility" | "sidewalk" | "clearance" | null {
@@ -685,8 +742,12 @@ function buildPatchesForJunction(analysis: JunctionAnalysis, profileMap: Profile
     if (bandId !== "carriageway") {
       continue;
     }
-    patches.push(...buildCarriagewayMouthPatches(analysis, branchBands));
+    patches.push(...buildCarriagewayMouthPatches(analysis, profileMap, branchBands));
     patches.push(...buildCarriagewayConnectorPatches(analysis, branchBands));
+    const centerPatch = buildCarriagewayCenterEnvelopePatch(analysis, profileMap, branchBands);
+    if (centerPatch) {
+      patches.push(centerPatch);
+    }
   }
 
   return patches;

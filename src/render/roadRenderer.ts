@@ -1121,23 +1121,6 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     const maxOffset = Math.max(...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
     const rawCenterline = chain.points.map((p) => ({ ...p }));
     const sourceCenterline = removePassThroughJunctionPoints(rawCenterline, chain, nodeMap, degrees);
-    const junctionStopNodes = [...new Set(chain.nodeIds)]
-      .filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3)
-      .map((nodeId) => {
-        const node = nodeMap.get(nodeId);
-        return node ? { nodeId, point: { x: node.x, y: node.y } } : null;
-      })
-      .filter((stop): stop is { nodeId: string; point: Point } => Boolean(stop));
-    const laneStopDistance = Math.max(18, maxOffset * 1.5);
-    const stoppedLaneSpans = visibleLaneSpansAroundStops(sourceCenterline, junctionStopNodes, laneStopDistance);
-    for (const stop of stoppedLaneSpans.stops) {
-      laneStops.push({
-        chainId: chain.id,
-        nodeId: stop.nodeId,
-        point: { ...stop.point },
-        distance: laneStopDistance,
-      });
-    }
     const splineTurnOptions = {
       angleThresholdDeg: 6,
       radiusFactor: 2.2,
@@ -1153,6 +1136,23 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
             turnOptions: splineTurnOptions,
           })
         : sourceCenterline;
+    const junctionStopNodes = [...new Set(chain.nodeIds)]
+      .filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3)
+      .map((nodeId) => {
+        const node = nodeMap.get(nodeId);
+        return node ? { nodeId, point: { x: node.x, y: node.y } } : null;
+      })
+      .filter((stop): stop is { nodeId: string; point: Point } => Boolean(stop));
+    const laneStopDistance = Math.max(18, maxOffset * 1.1);
+    const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, junctionStopNodes, laneStopDistance);
+    for (const stop of stoppedLaneSpans.stops) {
+      laneStops.push({
+        chainId: chain.id,
+        nodeId: stop.nodeId,
+        point: { ...stop.point },
+        distance: laneStopDistance,
+      });
+    }
     edgeCenterlines.push({
       id: chain.id,
       edgeIds: chain.edgeIds,
@@ -1180,24 +1180,23 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     }
 
     for (const band of bands) {
-      const spans = isOuterLaneBand(band) ? stoppedLaneSpans.spans : [sourceCenterline];
-      for (const span of spans) {
-        const spanUsesSmooth = span.length > 2;
-        const spanTurns = computeTurnSpecs(span, maxOffset, splineTurnOptions);
-        const spanCenterline = spanUsesSmooth
-          ? buildSkeletonPathByPoints(span, maxOffset, {
-              samplesPerTurn: 20,
-              turnOptions: splineTurnOptions,
-            })
-          : span;
-        const polygon = spanUsesSmooth
-          ? buildSmoothBandPolygon(spanCenterline, band.qInner, band.qOuter)
-          : buildBandPolygon(span, spanTurns, band.qInner, band.qOuter, {
-              samplesPerTurn: 20,
-            });
-        if (polygon.length < 3) {
-          continue;
+      if (isOuterLaneBand(band)) {
+        for (const span of stoppedLaneSpans.spans) {
+          const polygon = buildSmoothBandPolygon(span, band.qInner, band.qOuter);
+          if (polygon.length < 3) {
+            continue;
+          }
+          addBandPolygon(bandBuckets, band, polygon);
         }
+        continue;
+      }
+
+      const polygon = usesSmoothCenterline
+        ? buildSmoothBandPolygon(centerline, band.qInner, band.qOuter)
+        : buildBandPolygon(sourceCenterline, turns, band.qInner, band.qOuter, {
+            samplesPerTurn: 20,
+          });
+      if (polygon.length >= 3) {
         addBandPolygon(bandBuckets, band, polygon);
       }
     }
