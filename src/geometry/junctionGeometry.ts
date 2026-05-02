@@ -649,9 +649,6 @@ function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: Profi
       if (polygon.length < 4) {
         continue;
       }
-      if (!laneConnectorStaysOutsideCarriagewayCenter(analysis.point, polygon, profileMap, a, b)) {
-        continue;
-      }
 
       patches.push({
         nodeId: analysis.nodeId,

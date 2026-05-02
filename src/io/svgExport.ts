@@ -66,7 +66,7 @@ function sceneMeta(scene: RoadPenScene, junctions: Array<{ nodeId: string; type:
 
 export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): string {
   const { width, height, draftPoints } = options;
-  const { bandBuckets, junctions, junctionPatches, laneConnectorPatches, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
+  const { bandBuckets, junctions, junctionPatches, laneConnectorPatches, laneStops, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
   const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   const out: string[] = [
@@ -134,6 +134,17 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
   laneConnectorPatches.forEach((patch, index) => {
     out.push(
       `    <path id="lane-connector-${esc(patch.nodeId)}-${esc(patch.baseLane)}-${index}" data-node-id="${esc(patch.nodeId)}" data-base-lane="${esc(patch.baseLane)}" data-from-edge-id="${esc(patch.fromEdgeId)}" data-to-edge-id="${esc(patch.toEdgeId)}" d="${ringToPath(patch.polygon)}"/>`,
+    );
+  });
+
+  out.push(
+    "  </g>",
+    '  <g id="lane-stops" opacity="0.75" fill="rgba(244, 114, 182, 0.9)" stroke="#fce7f3" stroke-width="1">',
+  );
+
+  laneStops.forEach((stop, index) => {
+    out.push(
+      `    <circle id="lane-stop-${esc(stop.chainId)}-${esc(stop.nodeId)}-${index}" data-chain-id="${esc(stop.chainId)}" data-node-id="${esc(stop.nodeId)}" data-distance="${fmt(stop.distance)}" cx="${fmt(stop.point.x)}" cy="${fmt(stop.point.y)}" r="4"/>`,
     );
   });
 
