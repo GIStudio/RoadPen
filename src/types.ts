@@ -15,6 +15,8 @@ export type GeometryType = "polyline" | "spline";
 
 export type JunctionType = "line" | "curve" | "t" | "cross";
 
+export type RoadEndMode = "free" | "closed";
+
 export interface LaneProfile {
   id: string;
   name: string;
@@ -29,6 +31,7 @@ export interface RoadEdge {
   from: string;
   to: string;
   geomType: GeometryType;
+  endMode?: RoadEndMode;
   profileId: string;
   controlPoints: Point[];
 }
@@ -64,10 +67,11 @@ export interface TurnSpec {
   warning?: string;
 }
 
-export type ToolbarAction = "select" | "draw" | "finish" | "export" | "exportSvg" | "import";
+export type ToolbarAction = "select" | "draw" | "finish" | "export" | "exportSvg" | "import" | "endFree" | "endClosed";
 
 export interface ToolbarState {
   mode: "select" | "draw";
+  endMode: RoadEndMode;
   draftPoints: number;
   warningCount: number;
   canFinish: boolean;

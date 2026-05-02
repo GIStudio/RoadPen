@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button, Segmented } from "antd";
-import type { ToolbarAction, ToolbarState } from "../types";
+import type { RoadEndMode, ToolbarAction, ToolbarState } from "../types";
 
 const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
   { label: "选择", value: "select" },
@@ -9,6 +9,7 @@ const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
 
 const DEFAULT_STATE: ToolbarState = {
   mode: "select",
+  endMode: "free",
   draftPoints: 0,
   warningCount: 0,
   canFinish: false,
@@ -16,6 +17,10 @@ const DEFAULT_STATE: ToolbarState = {
 
 function emitAction(action: ToolbarAction): void {
   window.dispatchEvent(new CustomEvent<ToolbarAction>("roadpen:action", { detail: action }));
+}
+
+function emitEndMode(value: RoadEndMode): void {
+  emitAction(value === "closed" ? "endClosed" : "endFree");
 }
 
 export function ToolbarApp(): JSX.Element {
@@ -42,6 +47,15 @@ export function ToolbarApp(): JSX.Element {
         options={TOOLBAR_MODES}
         value={state.mode}
         onChange={(value) => emitAction(value as "select" | "draw")}
+      />
+      <Segmented
+        size="small"
+        options={[
+          { label: "末端自由", value: "free" },
+          { label: "圆头封闭", value: "closed" },
+        ]}
+        value={state.endMode}
+        onChange={(value) => emitEndMode(value as RoadEndMode)}
       />
       <Button
         danger

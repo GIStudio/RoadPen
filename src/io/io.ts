@@ -1,4 +1,4 @@
-import type { GeometryType, LaneProfile, RoadEdge, RoadPenScene, SceneNode } from "../types";
+import type { GeometryType, LaneProfile, RoadEdge, RoadEndMode, RoadPenScene, SceneNode } from "../types";
 
 export interface ImportResult {
   scene: RoadPenScene;
@@ -97,6 +97,10 @@ function asGeomType(v: unknown): GeometryType {
   return "spline";
 }
 
+function asRoadEndMode(v: unknown): RoadEndMode {
+  return v === "closed" ? "closed" : "free";
+}
+
 function ensureDefaultProfile(profiles: LaneProfile[]): string {
   const existed = new Set(profiles.map((p) => p.id));
   if (!existed.has("default")) {
@@ -188,6 +192,7 @@ export function normalizeScene(input: Partial<RoadPenScene>): RoadPenScene {
         from,
         to,
         geomType: asGeomType(edgeRaw.geomType),
+        endMode: asRoadEndMode(edgeRaw.endMode),
         profileId,
         controlPoints,
       });

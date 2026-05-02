@@ -109,6 +109,20 @@ describe("junctionGeometry", () => {
     expect(result.patches.some((patch) => patch.nodeId === "center" && patch.bandId === "carriageway")).toBe(true);
   });
 
+  test("T 路口只应让车行道进入中心融合，外侧 lane 应生成独立 connector", () => {
+    const result = buildJunctionGeometry(tScene());
+
+    expect(result.patches.every((patch) => patch.bandId === "carriageway")).toBe(true);
+    expect(result.patches.some((patch) => patch.nodeId === "center" && patch.bandId === "clearance_left")).toBe(false);
+    expect(result.patches.some((patch) => patch.nodeId === "center" && patch.bandId === "sidewalk_left")).toBe(false);
+    expect(result.patches.some((patch) => patch.nodeId === "center" && patch.bandId === "facility_left")).toBe(false);
+
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "facility")).toHaveLength(2);
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "sidewalk")).toHaveLength(2);
+    expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "clearance")).toHaveLength(2);
+    expect(result.laneConnectorPatches.every((patch) => patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
+  });
+
   test("四条道路共享节点时应识别为十字路口且补片不自交", () => {
     const result = buildJunctionGeometry(crossScene());
     const center = result.junctions.find((junction) => junction.nodeId === "center");
@@ -136,6 +150,8 @@ describe("junctionGeometry", () => {
     const svg = exportRoadSvg(tScene(), { width: 300, height: 300 });
 
     expect(svg).toContain('id="junction-patches"');
+    expect(svg).toContain('id="lane-connectors"');
+    expect(svg).toContain('data-base-lane="sidewalk"');
     expect(svg).toContain('id="junction-labels"');
     expect(svg).toContain('data-junction-type="t"');
   });

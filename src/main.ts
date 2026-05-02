@@ -3,7 +3,7 @@ import "antd/dist/reset.css";
 import * as G6 from "@antv/g6";
 import * as React from "react";
 import { createRoot } from "react-dom/client";
-import type { Point, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
+import type { Point, RoadEndMode, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
 import { exportScene, parseRoadPenScene } from "./io/io";
 import { exportRoadSvg } from "./io/svgExport";
 import { renderRoads } from "./render/roadRenderer";
@@ -31,6 +31,7 @@ interface AppState {
   draftAnchors: DraftAnchor[];
   draftStartNodeId: string | null;
   snapPreview: SnapTarget | null;
+  selectedEndMode: RoadEndMode;
   selectedProfileId: string;
 }
 
@@ -59,6 +60,7 @@ const app: AppState = {
   draftAnchors: [],
   draftStartNodeId: null,
   snapPreview: null,
+  selectedEndMode: "free",
   selectedProfileId: DEFAULT_PROFILE_ID,
 };
 
@@ -304,6 +306,7 @@ function snapStatusText(): string | null {
 function emitToolbarState(): void {
   const nextState: ToolbarState = {
     mode: app.mode,
+    endMode: app.selectedEndMode,
     draftPoints: app.draftPoints.length,
     warningCount: sceneWarnings.length,
     canFinish: app.mode === "draw" && app.draftPoints.length >= 2,
@@ -341,6 +344,16 @@ function handleToolbarAction(action: ToolbarAction): void {
   if (action === "import") {
     importInput.value = "";
     importInput.click();
+    return;
+  }
+  if (action === "endFree") {
+    app.selectedEndMode = "free";
+    requestRender();
+    return;
+  }
+  if (action === "endClosed") {
+    app.selectedEndMode = "closed";
+    requestRender();
   }
 }
 
@@ -552,7 +565,7 @@ function addEdgeFromDraft(chain = false): void {
     app.draftAnchors.length === app.draftPoints.length
       ? app.draftAnchors
       : app.draftPoints.map((point) => freeAnchor(point));
-  const result = commitRoadWithTopology(app.scene, anchors, app.selectedProfileId, nextNodeId, nextEdgeId);
+  const result = commitRoadWithTopology(app.scene, anchors, app.selectedProfileId, nextNodeId, nextEdgeId, app.selectedEndMode);
   if (!result || result.createdEdgeIds.length === 0) {
     if (result?.warnings.length) {
       sceneWarnings = result.warnings;

@@ -1,5 +1,5 @@
 import type { JunctionType, LaneBand, Point, RoadPenScene, SceneNode } from "../types";
-import type { JunctionAnalysis, JunctionPatch } from "../geometry/junctionGeometry";
+import type { JunctionAnalysis, JunctionPatch, LaneConnectorPatch } from "../geometry/junctionGeometry";
 import { buildJunctionGeometry } from "../geometry/junctionGeometry";
 import type { SnapTarget } from "../geometry/topology";
 import {
@@ -30,6 +30,7 @@ export interface RoadBandData {
   bandBuckets: Map<string, BandBucket>;
   junctions: JunctionAnalysis[];
   junctionPatches: JunctionPatch[];
+  laneConnectorPatches: LaneConnectorPatch[];
   edgeCenterlines: Array<{
     edgeId: string;
     geomType: string;
@@ -80,6 +81,180 @@ function indexNodes(scene: RoadPenScene): Map<string, SceneNode> {
     map.set(node.id, node);
   }
   return map;
+}
+
+function nodeDegreeMap(scene: RoadPenScene): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const edge of scene.edges) {
+    map.set(edge.from, (map.get(edge.from) ?? 0) + 1);
+    map.set(edge.to, (map.get(edge.to) ?? 0) + 1);
+  }
+  return map;
+}
+
+function addPoint(a: Point, b: Point): Point {
+  return { x: a.x + b.x, y: a.y + b.y };
+}
+
+function subPoint(a: Point, b: Point): Point {
+  return { x: a.x - b.x, y: a.y - b.y };
+}
+
+function scalePoint(point: Point, value: number): Point {
+  return { x: point.x * value, y: point.y * value };
+}
+
+function unitPoint(point: Point): Point | null {
+  const len = Math.hypot(point.x, point.y);
+  return len > EPS ? { x: point.x / len, y: point.y / len } : null;
+}
+
+function leftNormal(point: Point): Point {
+  return { x: -point.y, y: point.x };
+}
+
+function semicirclePoint(center: Point, outward: Point, radius: number, t: number): Point {
+  const normal = leftNormal(outward);
+  const angle = -Math.PI / 2 + Math.PI * t;
+  return addPoint(center, addPoint(scalePoint(outward, Math.cos(angle) * radius), scalePoint(normal, Math.sin(angle) * radius)));
+}
+
+function deadEndDisk(center: Point, outward: Point, radius: number, samples = 18): Point[] {
+  const points: Point[] = [];
+  for (let i = 0; i <= samples; i += 1) {
+    points.push(semicirclePoint(center, outward, radius, i / samples));
+  }
+  points.push({ ...center });
+  points.push({ ...points[0] });
+  return points;
+}
+
+function deadEndRing(center: Point, outward: Point, innerRadius: number, outerRadius: number, samples = 18): Point[] {
+  if (outerRadius <= innerRadius + 1e-6) {
+    return [];
+  }
+
+  const points: Point[] = [];
+  for (let i = 0; i <= samples; i += 1) {
+    points.push(semicirclePoint(center, outward, outerRadius, i / samples));
+  }
+  for (let i = samples; i >= 0; i -= 1) {
+    points.push(semicirclePoint(center, outward, innerRadius, i / samples));
+  }
+  points.push({ ...points[0] });
+  return points;
+}
+
+function endpointOutward(edge: RoadEdgeLike, atFrom: boolean): Point | null {
+  const points = edge.controlPoints;
+  if (points.length < 2) {
+    return null;
+  }
+  const start = atFrom ? points[0] : points[points.length - 1];
+  const next = atFrom ? points[1] : points[points.length - 2];
+  return unitPoint(subPoint(start, next));
+}
+
+type RoadEdgeLike = RoadPenScene["edges"][number];
+
+function capBucketId(base: string, edgeId: string, nodeId: string): string {
+  return `${base}_endcap_${edgeId}_${nodeId}`;
+}
+
+function semanticBandForBucket(band: LaneBand): LaneBand {
+  if (band.id.startsWith("facility")) {
+    return { ...band, id: "facility", name: "facility" };
+  }
+  if (band.id.startsWith("sidewalk")) {
+    return { ...band, id: "sidewalk", name: "sidewalk" };
+  }
+  if (band.id.startsWith("clearance")) {
+    return { ...band, id: "clearance", name: "clearance" };
+  }
+  return { ...band };
+}
+
+function addBandPolygon(bandBuckets: Map<string, BandBucket>, band: LaneBand, polygon: Point[]): void {
+  if (polygon.length < 4) {
+    return;
+  }
+  const bucketBand = semanticBandForBucket(band);
+  const bucket = bandBuckets.get(bucketBand.id) ?? { band: bucketBand, polygons: [] };
+  bandBuckets.set(bucketBand.id, bucket);
+  bucket.polygons.push(polygon);
+}
+
+function addDeadEndCaps(
+  scene: RoadPenScene,
+  nodeMap: Map<string, SceneNode>,
+  profileMap: Map<string, { carriagewayWidth: number; facilityWidth: number; sidewalkWidth: number; clearanceWidth: number }>,
+  bandBuckets: Map<string, BandBucket>,
+): void {
+  const degrees = nodeDegreeMap(scene);
+
+  for (const edge of scene.edges) {
+    if (edge.endMode !== "closed") {
+      continue;
+    }
+
+    const profile = profileMap.get(edge.profileId) ?? profileMap.get("default");
+    if (!profile) {
+      continue;
+    }
+
+    const bands = buildLaneBandsForProfile(edge.profileId, profileMap);
+    const carriageway = bands.find((band) => band.id === "carriageway");
+    const lanePairs = [
+      {
+        base: "facility",
+        left: bands.find((band) => band.id === "facility_left"),
+      },
+      {
+        base: "sidewalk",
+        left: bands.find((band) => band.id === "sidewalk_left"),
+      },
+      {
+        base: "clearance",
+        left: bands.find((band) => band.id === "clearance_left"),
+      },
+    ];
+
+    for (const endpoint of [
+      { nodeId: edge.from, atFrom: true },
+      { nodeId: edge.to, atFrom: false },
+    ]) {
+      if ((degrees.get(endpoint.nodeId) ?? 0) !== 1) {
+        continue;
+      }
+
+      const node = nodeMap.get(endpoint.nodeId);
+      const outward = endpointOutward(edge, endpoint.atFrom);
+      if (!node || !outward || !carriageway) {
+        continue;
+      }
+
+      const center = { x: node.x, y: node.y };
+      const carriagewayRadius = Math.max(Math.abs(carriageway.qInner), Math.abs(carriageway.qOuter));
+      addBandPolygon(bandBuckets, carriageway, deadEndDisk(center, outward, carriagewayRadius));
+
+      for (const pair of lanePairs) {
+        if (!pair.left) {
+          continue;
+        }
+        const innerRadius = Math.min(Math.abs(pair.left.qInner), Math.abs(pair.left.qOuter));
+        const outerRadius = Math.max(Math.abs(pair.left.qInner), Math.abs(pair.left.qOuter));
+        addBandPolygon(
+          bandBuckets,
+          {
+            ...pair.left,
+            id: capBucketId(pair.base, edge.id, endpoint.nodeId),
+            name: `${pair.base}-endcap`,
+          },
+          deadEndRing(center, outward, innerRadius, outerRadius),
+        );
+      }
+    }
+  }
 }
 
 export function polygonArea(points: Point[]): number {
@@ -316,11 +491,11 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
       if (polygon.length < 3) {
         continue;
       }
-      const bucket = bandBuckets.get(band.id) ?? { band: { ...band }, polygons: [] };
-      bandBuckets.set(band.id, bucket);
-      bucket.polygons.push(polygon);
+      addBandPolygon(bandBuckets, band, polygon);
     }
   }
+
+  addDeadEndCaps(scene, nodeMap, profileMap, bandBuckets);
 
   const junctionGeometry = buildJunctionGeometry(scene, profileMap);
   for (const warning of junctionGeometry.warnings) {
@@ -328,9 +503,11 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   }
 
   for (const patch of junctionGeometry.patches) {
-    const bucket = bandBuckets.get(patch.bandId) ?? { band: { ...patch.band }, polygons: [] };
-    bandBuckets.set(patch.bandId, bucket);
-    bucket.polygons.push(patch.polygon);
+    addBandPolygon(bandBuckets, patch.band, patch.polygon);
+  }
+
+  for (const patch of junctionGeometry.laneConnectorPatches) {
+    addBandPolygon(bandBuckets, patch.band, patch.polygon);
   }
 
   if (!bandBuckets.has("carriageway")) {
@@ -349,6 +526,7 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     bandBuckets,
     junctions: junctionGeometry.junctions,
     junctionPatches: junctionGeometry.patches,
+    laneConnectorPatches: junctionGeometry.laneConnectorPatches,
     edgeCenterlines,
     warnings: [...warnings],
   };
@@ -363,7 +541,7 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
   ctx.clearRect(0, 0, width, height);
 
   const { bandBuckets, junctions, warnings: geometryWarnings } = buildRoadBandPolygons(scene);
-  const orderedBands = [...bandBuckets.values()].sort((a, b) => b.band.zIndex - a.band.zIndex);
+  const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   for (const bucket of orderedBands) {
     const merged = mergeRoadJunction(bucket.polygons);

@@ -25,12 +25,13 @@ function sceneWithEdges(edges: RoadEdge[], nodes: RoadPenScene["nodes"]): RoadPe
   };
 }
 
-function road(id: string, from: string, to: string, points: Point[]): RoadEdge {
+function road(id: string, from: string, to: string, points: Point[], endMode: RoadEdge["endMode"] = "free"): RoadEdge {
   return {
     id,
     from,
     to,
     geomType: points.length === 2 ? "polyline" : "spline",
+    endMode,
     profileId: "default",
     controlPoints: points,
   };
@@ -127,5 +128,28 @@ describe("topology", () => {
 
     expect(warnings).toHaveLength(0);
     expect(junction).toMatchObject({ type: "cross", degree: 4 });
+  });
+
+  test("圆头封闭道路应在死胡同端生成车行道圆头和外侧 lane 半环", () => {
+    const scene = sceneWithEdges(
+      [road("closed", "a", "b", [{ x: 0, y: 0 }, { x: 100, y: 0 }], "closed")],
+      [
+        { id: "a", x: 0, y: 0 },
+        { id: "b", x: 100, y: 0 },
+      ],
+    );
+    const { bandBuckets } = buildRoadBandPolygons(scene);
+
+    expect(bandBuckets.get("carriageway")?.polygons.length).toBeGreaterThan(1);
+    expect(bandBuckets.get("facility")?.polygons.length).toBeGreaterThan(2);
+    expect(bandBuckets.get("sidewalk")?.polygons.length).toBeGreaterThan(2);
+    expect(bandBuckets.get("clearance")?.polygons.length).toBeGreaterThan(2);
+  });
+
+  test("默认自由端道路不应生成圆头封闭补片", () => {
+    const scene = horizontalScene();
+    const { bandBuckets } = buildRoadBandPolygons(scene);
+
+    expect([...bandBuckets.keys()].some((key) => key.includes("_endcap_"))).toBe(false);
   });
 });

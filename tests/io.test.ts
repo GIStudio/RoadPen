@@ -68,4 +68,30 @@ describe("import-export", () => {
     expect(scene.scalePxPerM).toBe(12);
     expect(scene.nodes).toHaveLength(2);
   });
+
+  test("道路末端模式应导入导出保持，旧数据默认自由端", () => {
+    const closedScene: RoadPenScene = {
+      ...fixtureScene,
+      edges: [
+        {
+          ...fixtureScene.edges[0],
+          endMode: "closed",
+        },
+      ],
+    };
+    const { scene } = parseRoadPenScene(exportScene(closedScene));
+    const { scene: legacyScene } = parseRoadPenScene(
+      JSON.stringify({
+        version: "1.0.0",
+        units: "px",
+        scalePxPerM: 20,
+        nodes: fixtureScene.nodes,
+        edges: fixtureScene.edges,
+        profiles: fixtureScene.profiles,
+      }),
+    );
+
+    expect(scene.edges[0].endMode).toBe("closed");
+    expect(legacyScene.edges[0].endMode).toBe("free");
+  });
 });

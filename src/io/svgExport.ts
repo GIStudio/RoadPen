@@ -66,8 +66,8 @@ function sceneMeta(scene: RoadPenScene, junctions: Array<{ nodeId: string; type:
 
 export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): string {
   const { width, height, draftPoints } = options;
-  const { bandBuckets, junctions, junctionPatches, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
-  const orderedBands = [...bandBuckets.values()].sort((a, b) => b.band.zIndex - a.band.zIndex);
+  const { bandBuckets, junctions, junctionPatches, laneConnectorPatches, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
+  const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   const out: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${fmt(width)}" height="${fmt(height)}" viewBox="0 0 ${fmt(width)} ${fmt(height)}">`,
@@ -123,6 +123,17 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
   junctionPatches.forEach((patch, index) => {
     out.push(
       `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" d="${ringToPath(patch.polygon)}"/>`,
+    );
+  });
+
+  out.push(
+    "  </g>",
+    '  <g id="lane-connectors" opacity="0.5" fill="rgba(34, 197, 94, 0.26)" stroke="#22c55e" stroke-width="1.25">',
+  );
+
+  laneConnectorPatches.forEach((patch, index) => {
+    out.push(
+      `    <path id="lane-connector-${esc(patch.nodeId)}-${esc(patch.baseLane)}-${index}" data-node-id="${esc(patch.nodeId)}" data-base-lane="${esc(patch.baseLane)}" data-from-edge-id="${esc(patch.fromEdgeId)}" data-to-edge-id="${esc(patch.toEdgeId)}" d="${ringToPath(patch.polygon)}"/>`,
     );
   });
 

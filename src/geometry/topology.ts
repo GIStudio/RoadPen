@@ -1,4 +1,4 @@
-import type { GeometryType, Point, RoadEdge, RoadPenScene, SceneNode } from "../types";
+import type { GeometryType, Point, RoadEdge, RoadEndMode, RoadPenScene, SceneNode } from "../types";
 
 export type SnapTarget =
   | {
@@ -375,6 +375,7 @@ export function splitEdgesAtTargets(scene: RoadPenScene, targets: SplitTarget[],
       from: piece.from,
       to: piece.to,
       geomType: geometryTypeForControlPoints(piece.points),
+      endMode: edge.endMode,
       profileId: edge.profileId,
       controlPoints: piece.points,
     }));
@@ -418,6 +419,7 @@ export function commitRoadWithTopology(
   profileId: string,
   nodeIdFactory: () => string,
   edgeIdFactory: () => string,
+  endMode: RoadEndMode = "free",
 ): TopologyCommitResult | null {
   if (anchors.length < 2) {
     return null;
@@ -487,6 +489,7 @@ export function commitRoadWithTopology(
       from: piece.from,
       to: piece.to,
       geomType: geometryTypeForControlPoints(piece.points),
+      endMode,
       profileId,
       controlPoints: piece.points,
     };

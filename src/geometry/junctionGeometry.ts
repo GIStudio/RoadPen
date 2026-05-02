@@ -23,9 +23,19 @@ export interface JunctionPatch {
   polygon: Point[];
 }
 
+export interface LaneConnectorPatch {
+  nodeId: string;
+  baseLane: "facility" | "sidewalk" | "clearance";
+  fromEdgeId: string;
+  toEdgeId: string;
+  band: LaneBand;
+  polygon: Point[];
+}
+
 export interface JunctionGeometry {
   junctions: JunctionAnalysis[];
   patches: JunctionPatch[];
+  laneConnectorPatches: LaneConnectorPatch[];
   warnings: string[];
 }
 
@@ -59,8 +69,21 @@ function leftNormal(direction: Point): Point {
   return { x: -direction.y, y: direction.x };
 }
 
+function dot(a: Point, b: Point): number {
+  return a.x * b.x + a.y * b.y;
+}
+
 function cross(a: Point, b: Point, c: Point): number {
   return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+function lineIntersection(p: Point, d: Point, q: Point, e: Point): Point | null {
+  const den = d.x * e.y - d.y * e.x;
+  if (Math.abs(den) <= EPS) {
+    return null;
+  }
+  const t = ((q.x - p.x) * e.y - (q.y - p.y) * e.x) / den;
+  return add(p, scale(d, t));
 }
 
 function profileMapFromScene(scene: RoadPenScene): ProfileMap {
@@ -157,7 +180,11 @@ function patchRadiusForBand(band: LaneBand): number {
   return Math.max(18, maxOffset * 1.45);
 }
 
-function buildPatchForBand(analysis: JunctionAnalysis, bandId: string, branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>): JunctionPatch | null {
+function buildCarriagewayPatchForBand(
+  analysis: JunctionAnalysis,
+  bandId: string,
+  branchBands: Array<{ branch: JunctionBranch; band: LaneBand }>,
+): JunctionPatch | null {
   if (analysis.degree < 3 || branchBands.length < 2) {
     return null;
   }
@@ -189,6 +216,221 @@ function buildPatchForBand(analysis: JunctionAnalysis, bandId: string, branchBan
   };
 }
 
+function bandBaseId(id: string): "facility" | "sidewalk" | "clearance" | null {
+  if (id.startsWith("facility_")) {
+    return "facility";
+  }
+  if (id.startsWith("sidewalk_")) {
+    return "sidewalk";
+  }
+  if (id.startsWith("clearance_")) {
+    return "clearance";
+  }
+  return null;
+}
+
+function branchBand(profileMap: ProfileMap, branch: JunctionBranch, bandId: string): LaneBand | null {
+  return buildLaneBandsForProfile(branch.profileId, profileMap).find((band) => band.id === bandId) ?? null;
+}
+
+function quadraticPoints(p0: Point, p1: Point, p2: Point, samples = 8): Point[] {
+  const out: Point[] = [];
+  const steps = Math.max(3, Math.floor(samples));
+  for (let i = 0; i <= steps; i += 1) {
+    const t = i / steps;
+    const mt = 1 - t;
+    out.push({
+      x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x,
+      y: mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y,
+    });
+  }
+  return out;
+}
+
+function normalizedAngleDelta(from: number, to: number): number {
+  let delta = to - from;
+  while (delta > Math.PI) {
+    delta -= Math.PI * 2;
+  }
+  while (delta < -Math.PI) {
+    delta += Math.PI * 2;
+  }
+  return delta;
+}
+
+function arcAroundCenter(center: Point, start: Point, end: Point, samples = 12): Point[] {
+  const r0 = distance(center, start);
+  const r1 = distance(center, end);
+  if (r0 <= 1e-6 || r1 <= 1e-6) {
+    return [];
+  }
+
+  const a0 = Math.atan2(start.y - center.y, start.x - center.x);
+  const delta = normalizedAngleDelta(a0, Math.atan2(end.y - center.y, end.x - center.x));
+  const steps = Math.max(4, Math.floor(samples));
+  const out: Point[] = [];
+
+  for (let i = 0; i <= steps; i += 1) {
+    const t = i / steps;
+    const angle = a0 + delta * t;
+    const radius = r0 + (r1 - r0) * t;
+    out.push({
+      x: center.x + Math.cos(angle) * radius,
+      y: center.y + Math.sin(angle) * radius,
+    });
+  }
+
+  return out;
+}
+
+function filletArcAtBoundaryCorner(junctionPoint: Point, corner: Point, start: Point, end: Point, samples = 12): Point[] {
+  const toStart = normalize(sub(start, corner));
+  const toEnd = normalize(sub(end, corner));
+  if (!toStart || !toEnd) {
+    return [];
+  }
+
+  const dotValue = Math.max(-1, Math.min(1, dot(toStart, toEnd)));
+  const theta = Math.acos(dotValue);
+  if (theta <= Math.PI / 36 || theta >= Math.PI - Math.PI / 36) {
+    return [];
+  }
+
+  const startDist = distance(corner, start);
+  const endDist = distance(corner, end);
+  const tangentDist = Math.max(4, Math.min(startDist, endDist) * 0.72);
+  const radius = tangentDist * Math.tan(theta / 2);
+  const bisector = normalize(add(toStart, toEnd));
+  if (!bisector || radius <= 1e-6) {
+    return [];
+  }
+
+  const centerDist = radius / Math.sin(theta / 2);
+  const awayFromJunction = sub(corner, junctionPoint);
+  const orientedBisector = dot(bisector, awayFromJunction) >= 0 ? bisector : scale(bisector, -1);
+  const center = add(corner, scale(orientedBisector, centerDist));
+  const tangentA = add(corner, scale(toStart, tangentDist));
+  const tangentB = add(corner, scale(toEnd, tangentDist));
+  return arcAroundCenter(center, tangentA, tangentB, samples);
+}
+
+function offsetCornerBoundary(point: Point, aDir: Point, aQ: number, bDir: Point, bQ: number): Point[] {
+  const aNormal = leftNormal(aDir);
+  const bNormal = leftNormal(bDir);
+  const start = add(point, scale(aNormal, aQ));
+  const end = add(point, scale(bNormal, bQ));
+  const control =
+    lineIntersection(start, aDir, end, bDir) ?? {
+      x: (start.x + end.x + point.x) / 3,
+      y: (start.y + end.y + point.y) / 3,
+    };
+
+  if (distance(start, end) <= 1e-6) {
+    return [];
+  }
+
+  const arc = filletArcAtBoundaryCorner(point, control, start, end, 12);
+  return arc.length > 0 ? arc : quadraticPoints(start, control, end, 10);
+}
+
+function buildLaneConnectorPolygon(point: Point, aDir: Point, aLeft: LaneBand, bDir: Point, bRight: LaneBand): Point[] {
+  const aNormal = leftNormal(aDir);
+  const bNormal = leftNormal(bDir);
+  const polygon = [
+    add(point, scale(aNormal, aLeft.qInner)),
+    add(point, scale(bNormal, bRight.qOuter)),
+    add(point, scale(bNormal, bRight.qInner)),
+    add(point, scale(aNormal, aLeft.qOuter)),
+  ];
+  const first = polygon[0];
+  const last = polygon[polygon.length - 1];
+  if (Math.abs(first.x - last.x) > 1e-6 || Math.abs(first.y - last.y) > 1e-6) {
+    polygon.push({ ...first });
+  }
+  return polygon;
+}
+
+function sortedBranches(branches: JunctionBranch[]): JunctionBranch[] {
+  return [...branches].sort((a, b) => Math.atan2(a.direction.y, a.direction.x) - Math.atan2(b.direction.y, b.direction.x));
+}
+
+function branchGapDot(a: JunctionBranch, b: JunctionBranch): number {
+  return dot(a.direction, b.direction);
+}
+
+function directionAngle(direction: Point): number {
+  return Math.atan2(direction.y, direction.x);
+}
+
+function ccwGap(a: JunctionBranch, b: JunctionBranch): number {
+  const raw = directionAngle(b.direction) - directionAngle(a.direction);
+  return raw >= 0 ? raw : raw + Math.PI * 2;
+}
+
+function canBuildCollisionCorner(a: JunctionBranch, b: JunctionBranch): boolean {
+  if (a.edgeId === b.edgeId) {
+    return false;
+  }
+
+  const gap = ccwGap(a, b);
+  if (gap <= Math.PI / 36 || gap >= Math.PI * 0.75) {
+    return false;
+  }
+
+  const gapDot = branchGapDot(a, b);
+  return gapDot > -0.707 && gapDot < 0.985;
+}
+
+function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: ProfileMap): LaneConnectorPatch[] {
+  if (analysis.degree < 3) {
+    return [];
+  }
+
+  const branches = sortedBranches(analysis.branches);
+  const bases: Array<"facility" | "sidewalk" | "clearance"> = ["facility", "sidewalk", "clearance"];
+  const patches: LaneConnectorPatch[] = [];
+
+  for (const base of bases) {
+    for (let i = 0; i < branches.length; i += 1) {
+      const a = branches[i];
+      const b = branches[(i + 1) % branches.length];
+      const aLeft = branchBand(profileMap, a, `${base}_left`);
+      const bRight = branchBand(profileMap, b, `${base}_right`);
+      if (!aLeft || !bRight) {
+        continue;
+      }
+
+      if (Math.abs(aLeft.qOuter - aLeft.qInner) <= 1e-6 || Math.abs(bRight.qOuter - bRight.qInner) <= 1e-6) {
+        continue;
+      }
+
+      if (!canBuildCollisionCorner(a, b)) {
+        continue;
+      }
+
+      const polygon = buildLaneConnectorPolygon(analysis.point, a.direction, aLeft, b.direction, bRight);
+      if (polygon.length < 4) {
+        continue;
+      }
+
+      patches.push({
+        nodeId: analysis.nodeId,
+        baseLane: base,
+        fromEdgeId: a.edgeId,
+        toEdgeId: b.edgeId,
+        band: {
+          ...aLeft,
+          id: base,
+          name: base,
+        },
+        polygon,
+      });
+    }
+  }
+
+  return patches;
+}
+
 function buildPatchesForJunction(analysis: JunctionAnalysis, profileMap: ProfileMap): JunctionPatch[] {
   const byBand = new Map<string, Array<{ branch: JunctionBranch; band: LaneBand }>>();
 
@@ -203,7 +445,10 @@ function buildPatchesForJunction(analysis: JunctionAnalysis, profileMap: Profile
 
   const patches: JunctionPatch[] = [];
   for (const [bandId, branchBands] of byBand) {
-    const patch = buildPatchForBand(analysis, bandId, branchBands);
+    if (bandId !== "carriageway") {
+      continue;
+    }
+    const patch = buildCarriagewayPatchForBand(analysis, bandId, branchBands);
     if (patch) {
       patches.push(patch);
     }
@@ -239,6 +484,7 @@ export function buildJunctionGeometry(scene: RoadPenScene, profileMap: ProfileMa
 
   const junctions: JunctionAnalysis[] = [];
   const patches: JunctionPatch[] = [];
+  const laneConnectorPatches: LaneConnectorPatch[] = [];
 
   for (const node of scene.nodes) {
     const edges = edgesByNode.get(node.id) ?? [];
@@ -274,8 +520,9 @@ export function buildJunctionGeometry(scene: RoadPenScene, profileMap: ProfileMa
         warnings.push(`路口 ${node.id}：无法生成 ${type.toUpperCase()} 路口补片。`);
       }
       patches.push(...junctionPatches);
+      laneConnectorPatches.push(...buildLaneConnectorPatches(analysis, profileMap));
     }
   }
 
-  return { junctions, patches, warnings };
+  return { junctions, patches, laneConnectorPatches, warnings };
 }
