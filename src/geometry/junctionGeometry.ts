@@ -29,6 +29,9 @@ export interface LaneConnectorPatch {
   baseLane: "facility" | "sidewalk" | "clearance";
   fromEdgeId: string;
   toEdgeId: string;
+  gapRadians: number;
+  fromStopPoint: Point;
+  toStopPoint: Point;
   band: LaneBand;
   polygon: Point[];
 }
@@ -49,6 +52,9 @@ const JUNCTION_LANE_MIN_TURN_RADIUS = 10;
 const JUNCTION_LANE_RADIUS_FACTOR = 2.2;
 const JUNCTION_LANE_CURVE_SAMPLES = 18;
 const PASS_THROUGH_DOT = -0.82;
+const MIN_LANE_CONNECTOR_GAP = Math.PI / 12;
+const MAX_LANE_CONNECTOR_GAP = Math.PI * 0.93;
+const WIDE_LANE_CONNECTOR_GAP = Math.PI / 2;
 
 function add(a: Point, b: Point): Point {
   return { x: a.x + b.x, y: a.y + b.y };
@@ -208,7 +214,7 @@ function carriagewayJunctionDepthForBranch(profileMap: ProfileMap, branch: Junct
 }
 
 function buildCarriagewayConnectorPolygon(point: Point, aDir: Point, aBand: LaneBand, bDir: Point, bBand: LaneBand): Point[] {
-  const turn = buildVirtualLaneTurn(point, aDir, bDir, aBand, bBand);
+  const turn = buildVirtualLaneTurn(point, aDir, bDir, aBand, bBand, compactConnectorEll(aDir, bDir, aBand, bBand));
   if (!turn) {
     return [];
   }
@@ -504,11 +510,41 @@ function connectorDepth(aLeft: LaneBand, bRight: LaneBand): number {
   return clamp(maxOffset * 1.5, 18, 42);
 }
 
+function wideConnectorDepth(profileMap: ProfileMap, a: JunctionBranch, b: JunctionBranch): number {
+  const maxOffset = Math.max(maxProfileOffset(profileMap, a.profileId), maxProfileOffset(profileMap, b.profileId));
+  return clamp(maxOffset * 1.65, 36, 92);
+}
+
 function virtualLaneBoundaryQ(leftQ: number, rightQ: number): number {
   return (-leftQ + rightQ) / 2;
 }
 
-function buildVirtualLaneTurn(point: Point, aDir: Point, bDir: Point, aReference: LaneBand, bReference: LaneBand): TurnSpec | null {
+function compactConnectorEll(aDir: Point, bDir: Point, aReference: LaneBand, bReference: LaneBand): number {
+  const u = scale(aDir, -1);
+  const v = bDir;
+  const delta = Math.acos(clamp(dot(u, v), -1, 1));
+  const maxOffset = Math.max(
+    Math.abs(aReference.qInner),
+    Math.abs(aReference.qOuter),
+    Math.abs(bReference.qInner),
+    Math.abs(bReference.qOuter),
+  );
+  const minRadius = maxOffset + JUNCTION_LANE_MIN_TURN_RADIUS * 0.5;
+  const desiredRadius = Math.max(maxOffset * 2 * JUNCTION_LANE_RADIUS_FACTOR, JUNCTION_LANE_MIN_TURN_RADIUS);
+  const desiredEll = desiredRadius * Math.tan(delta / 2);
+  const mouthLimit = connectorDepth(aReference, bReference);
+  const minEll = minRadius * Math.tan(delta / 2);
+  return clamp(desiredEll, Math.max(JUNCTION_LANE_MIN_TURN_RADIUS * 0.6, minEll), Math.max(mouthLimit, minEll));
+}
+
+function buildVirtualLaneTurn(
+  point: Point,
+  aDir: Point,
+  bDir: Point,
+  aReference: LaneBand,
+  bReference: LaneBand,
+  ellHint: number,
+): TurnSpec | null {
   const u = scale(aDir, -1);
   const v = bDir;
   const dotValue = clamp(dot(u, v), -1, 1);
@@ -525,11 +561,8 @@ function buildVirtualLaneTurn(point: Point, aDir: Point, bDir: Point, aReference
     Math.abs(bReference.qOuter),
   );
   const minRadius = maxOffset + JUNCTION_LANE_MIN_TURN_RADIUS * 0.5;
-  const desiredRadius = Math.max(maxOffset * 2 * JUNCTION_LANE_RADIUS_FACTOR, JUNCTION_LANE_MIN_TURN_RADIUS);
-  const desiredEll = desiredRadius * Math.tan(delta / 2);
-  const mouthLimit = connectorDepth(aReference, bReference);
   const minEll = minRadius * Math.tan(delta / 2);
-  const ell = clamp(desiredEll, Math.max(JUNCTION_LANE_MIN_TURN_RADIUS * 0.6, minEll), Math.max(mouthLimit, minEll));
+  const ell = Math.max(ellHint, JUNCTION_LANE_MIN_TURN_RADIUS * 0.6, minEll);
   const radius = Math.max(ell / Math.tan(delta / 2), JUNCTION_LANE_MIN_TURN_RADIUS);
 
   return {
@@ -546,7 +579,7 @@ function buildVirtualLaneTurn(point: Point, aDir: Point, bDir: Point, aReference
   };
 }
 
-function buildLaneConnectorPolygon(
+function buildLaneConnectorGeometry(
   point: Point,
   aDir: Point,
   aLeft: LaneBand,
@@ -554,10 +587,11 @@ function buildLaneConnectorPolygon(
   bRight: LaneBand,
   aReference: LaneBand,
   bReference: LaneBand,
-): Point[] {
-  const turn = buildVirtualLaneTurn(point, aDir, bDir, aReference, bReference);
+  ellHint: number,
+): { polygon: Point[]; fromStopPoint: Point; toStopPoint: Point } | null {
+  const turn = buildVirtualLaneTurn(point, aDir, bDir, aReference, bReference, ellHint);
   if (!turn) {
-    return [];
+    return null;
   }
 
   const outerQ = virtualLaneBoundaryQ(aLeft.qOuter, bRight.qInner);
@@ -565,12 +599,16 @@ function buildLaneConnectorPolygon(
   const outerCurve = sampleOffsetTurnCurve(turn, outerQ, JUNCTION_LANE_CURVE_SAMPLES);
   const innerCurve = sampleOffsetTurnCurve(turn, innerQ, JUNCTION_LANE_CURVE_SAMPLES);
   if (outerCurve.length < 4 || innerCurve.length < 4) {
-    return [];
+    return null;
   }
 
   const polygon = [...outerCurve, ...innerCurve.reverse()];
   polygon.push({ ...polygon[0] });
-  return polygon;
+  return {
+    polygon,
+    fromStopPoint: { ...turn.a },
+    toStopPoint: { ...turn.b },
+  };
 }
 
 function carriagewayHalfWidth(profileMap: ProfileMap, a: JunctionBranch, b: JunctionBranch): number {
@@ -623,12 +661,12 @@ function canBuildCollisionCorner(a: JunctionBranch, b: JunctionBranch): boolean 
   }
 
   const gap = ccwGap(a, b);
-  if (gap <= Math.PI / 36 || gap >= Math.PI * 0.75) {
+  if (gap <= MIN_LANE_CONNECTOR_GAP || gap >= MAX_LANE_CONNECTOR_GAP) {
     return false;
   }
 
   const gapDot = branchGapDot(a, b);
-  return gapDot > -0.707 && gapDot < 0.985;
+  return gapDot > -0.96 && gapDot < Math.cos(MIN_LANE_CONNECTOR_GAP);
 }
 
 function branchPairKey(a: JunctionBranch, b: JunctionBranch): string {
@@ -702,8 +740,13 @@ function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: Profi
         continue;
       }
 
-      const polygon = buildLaneConnectorPolygon(analysis.point, a.direction, aLeft, b.direction, bRight, aReference, bReference);
-      if (polygon.length < 4) {
+      const gapRadians = ccwGap(a, b);
+      const ellHint =
+        gapRadians <= WIDE_LANE_CONNECTOR_GAP
+          ? compactConnectorEll(a.direction, b.direction, aReference, bReference)
+          : wideConnectorDepth(profileMap, a, b);
+      const connector = buildLaneConnectorGeometry(analysis.point, a.direction, aLeft, b.direction, bRight, aReference, bReference, ellHint);
+      if (!connector || connector.polygon.length < 4) {
         continue;
       }
 
@@ -712,12 +755,15 @@ function buildLaneConnectorPatches(analysis: JunctionAnalysis, profileMap: Profi
         baseLane: base,
         fromEdgeId: a.edgeId,
         toEdgeId: b.edgeId,
+        gapRadians,
+        fromStopPoint: connector.fromStopPoint,
+        toStopPoint: connector.toStopPoint,
         band: {
           ...aLeft,
           id: base,
           name: base,
         },
-        polygon,
+        polygon: connector.polygon,
       });
     }
   }

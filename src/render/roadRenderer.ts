@@ -203,6 +203,27 @@ interface ChainBranch {
 const PASS_THROUGH_DOT = -0.82;
 const LANE_STOP_MIN_SPAN = 8;
 
+interface LaneStopCandidate {
+  nodeId: string;
+  point: Point;
+  kind: "node" | "connector";
+}
+
+interface ProjectedLaneStop {
+  nodeId: string;
+  point: Point;
+  distanceAlong: number;
+  stopDistance: number;
+  kind: "node" | "connector";
+}
+
+interface ConnectorStopEntry {
+  edgeId: string;
+  point: Point;
+  baseLane: LaneBase;
+  side: BranchSide;
+}
+
 function laneBaseForBand(band: LaneBand): LaneBase | null {
   if (band.id.startsWith("facility")) {
     return "facility";
@@ -242,6 +263,28 @@ function bandSideAtEndpoint(edge: RoadEdgeLike, nodeId: string, band: LaneBand):
   }
   if (nodeId === edge.to) {
     return edgeSide === "left" ? "right" : "left";
+  }
+  return null;
+}
+
+function chainBandSideAtNode(chain: VisualChain, nodeId: string, edgeId: string, band: LaneBand): BranchSide | null {
+  const isLeftBand = band.id.endsWith("_left");
+  const isRightBand = band.id.endsWith("_right");
+  if (!isLeftBand && !isRightBand) {
+    return null;
+  }
+
+  const index = chain.edgeIds.indexOf(edgeId);
+  if (index < 0) {
+    return null;
+  }
+
+  const chainSide: BranchSide = isLeftBand ? "left" : "right";
+  if (chain.nodeIds[index] === nodeId) {
+    return chainSide;
+  }
+  if (chain.nodeIds[index + 1] === nodeId) {
+    return chainSide === "left" ? "right" : "left";
   }
   return null;
 }
@@ -404,9 +447,9 @@ function projectPointToPolylineDistance(points: Point[], point: Point): { distan
 
 function visibleLaneSpansAroundStops(
   points: Point[],
-  stops: Array<{ nodeId: string; point: Point }>,
-  stopDistance: number,
-): { spans: Point[][]; stops: Array<{ nodeId: string; point: Point; distance: number }> } {
+  stops: LaneStopCandidate[],
+  defaultStopDistance: number,
+): { spans: Point[][]; stops: ProjectedLaneStop[] } {
   if (points.length < 2 || stops.length === 0) {
     return { spans: [points.map((point) => ({ ...point }))], stops: [] };
   }
@@ -416,25 +459,57 @@ function visibleLaneSpansAroundStops(
   const projectedStops = stops
     .map((stop) => {
       const projected = projectPointToPolylineDistance(points, stop.point);
+      const stopDistance = defaultStopDistance;
       return projected && projected.distanceToPath <= Math.max(2, stopDistance * 0.6)
         ? {
             nodeId: stop.nodeId,
             point: projected.point,
-            distance: projected.distanceAlong,
+            distanceAlong: projected.distanceAlong,
+            stopDistance,
+            kind: stop.kind,
           }
         : null;
     })
-    .filter((stop): stop is { nodeId: string; point: Point; distance: number } => Boolean(stop))
-    .sort((a, b) => a.distance - b.distance);
+    .filter((stop): stop is ProjectedLaneStop => Boolean(stop))
+    .sort((a, b) => a.distanceAlong - b.distanceAlong);
 
   if (projectedStops.length === 0) {
     return { spans: [points.map((point) => ({ ...point }))], stops: [] };
   }
 
-  const intervals = projectedStops.map((stop) => ({
-    start: Math.max(0, stop.distance - stopDistance),
-    end: Math.min(total, stop.distance + stopDistance),
-  }));
+  const groups = new Map<string, ProjectedLaneStop[]>();
+  for (const stop of projectedStops) {
+    const group = groups.get(stop.nodeId) ?? [];
+    group.push(stop);
+    groups.set(stop.nodeId, group);
+  }
+
+  const intervals = [...groups.values()]
+    .flatMap((group) => {
+      const intervalsForNode: Array<{ start: number; end: number }> = [];
+      const centerStops = group.filter((stop) => stop.kind === "node");
+      const connectorStops = group.filter((stop) => stop.kind === "connector");
+
+      if (connectorStops.length > 0) {
+        const distances = [...connectorStops, ...centerStops].map((stop) => stop.distanceAlong);
+        intervalsForNode.push({
+          start: Math.max(0, Math.min(...distances)),
+          end: Math.min(total, Math.max(...distances)),
+        });
+      }
+
+      if (connectorStops.length === 0) {
+        for (const stop of centerStops) {
+          intervalsForNode.push({
+            start: Math.max(0, stop.distanceAlong - stop.stopDistance),
+            end: Math.min(total, stop.distanceAlong + stop.stopDistance),
+          });
+        }
+      }
+
+      return intervalsForNode;
+    })
+    .sort((a, b) => a.start - b.start);
 
   const merged: Array<{ start: number; end: number }> = [];
   for (const interval of intervals) {
@@ -1085,6 +1160,7 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   const bandBuckets = new Map<string, BandBucket>();
   const edgeCenterlines: RoadBandData["edgeCenterlines"] = [];
   const laneStops: RoadBandData["laneStops"] = [];
+  const laneStopDebugKeys = new Set<string>();
   const warnings = new Set<string>();
 
   const profileMap = new Map<string, { carriagewayWidth: number; facilityWidth: number; sidewalkWidth: number; clearanceWidth: number }>();
@@ -1098,6 +1174,13 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   }
 
   const junctionGeometry = buildJunctionGeometry(scene, profileMap);
+  const connectorStopsByNode = new Map<string, ConnectorStopEntry[]>();
+  for (const patch of junctionGeometry.laneConnectorPatches) {
+    const stops = connectorStopsByNode.get(patch.nodeId) ?? [];
+    stops.push({ edgeId: patch.fromEdgeId, point: { ...patch.fromStopPoint }, baseLane: patch.baseLane, side: "left" });
+    stops.push({ edgeId: patch.toEdgeId, point: { ...patch.toStopPoint }, baseLane: patch.baseLane, side: "right" });
+    connectorStopsByNode.set(patch.nodeId, stops);
+  }
   const { chains: visualChains } = buildVisualChains(scene);
   for (const warning of junctionGeometry.warnings) {
     warnings.add(warning);
@@ -1136,23 +1219,31 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
             turnOptions: splineTurnOptions,
           })
         : sourceCenterline;
-    const junctionStopNodes = [...new Set(chain.nodeIds)]
-      .filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3)
-      .map((nodeId) => {
+    const defaultLaneStopDistance = Math.max(18, maxOffset * 1.1);
+    const junctionNodeIds = [...new Set(chain.nodeIds)].filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3);
+    const chainEdgeIds = new Set(chain.edgeIds);
+    const laneStopsForBand = (band: LaneBand): LaneStopCandidate[] =>
+      junctionNodeIds.flatMap((nodeId) => {
         const node = nodeMap.get(nodeId);
-        return node ? { nodeId, point: { x: node.x, y: node.y } } : null;
-      })
-      .filter((stop): stop is { nodeId: string; point: Point } => Boolean(stop));
-    const laneStopDistance = Math.max(18, maxOffset * 1.1);
-    const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, junctionStopNodes, laneStopDistance);
-    for (const stop of stoppedLaneSpans.stops) {
-      laneStops.push({
-        chainId: chain.id,
-        nodeId: stop.nodeId,
-        point: { ...stop.point },
-        distance: laneStopDistance,
+        if (!node) {
+          return [];
+        }
+        const stops: LaneStopCandidate[] = [{ nodeId, point: { x: node.x, y: node.y }, kind: "node" }];
+        const base = laneBaseForBand(band);
+        if (!base) {
+          return stops;
+        }
+        for (const stop of connectorStopsByNode.get(nodeId) ?? []) {
+          if (
+            chainEdgeIds.has(stop.edgeId) &&
+            stop.baseLane === base &&
+            chainBandSideAtNode(chain, nodeId, stop.edgeId, band) === stop.side
+          ) {
+            stops.push({ nodeId, point: { ...stop.point }, kind: "connector" });
+          }
+        }
+        return stops;
       });
-    }
     edgeCenterlines.push({
       id: chain.id,
       edgeIds: chain.edgeIds,
@@ -1181,6 +1272,19 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
 
     for (const band of bands) {
       if (isOuterLaneBand(band)) {
+        const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, laneStopsForBand(band), defaultLaneStopDistance);
+        for (const stop of stoppedLaneSpans.stops) {
+          const key = `${chain.id}:${band.id}:${stop.nodeId}:${stop.point.x.toFixed(2)}:${stop.point.y.toFixed(2)}`;
+          if (!laneStopDebugKeys.has(key)) {
+            laneStopDebugKeys.add(key);
+            laneStops.push({
+              chainId: chain.id,
+              nodeId: stop.nodeId,
+              point: { ...stop.point },
+              distance: stop.stopDistance,
+            });
+          }
+        }
         for (const span of stoppedLaneSpans.spans) {
           const polygon = buildSmoothBandPolygon(span, band.qInner, band.qOuter);
           if (polygon.length < 3) {
