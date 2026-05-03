@@ -1,5 +1,5 @@
-import type { JunctionType, LaneBand, Point, RoadPenScene, SceneNode } from "../types";
-import type { JunctionAnalysis, JunctionPatch, LaneConnectorPatch } from "../geometry/junctionGeometry";
+import type { DebugSettings, JunctionType, LaneBand, Point, RoadEdge, RoadPenScene, SceneNode } from "../types";
+import type { CarriagewayVirtualMouthLine, JunctionAnalysis, JunctionBlock, JunctionPatch, LaneConnectorPatch } from "../geometry/junctionGeometry";
 import { buildJunctionGeometry } from "../geometry/junctionGeometry";
 import type { SnapTarget } from "../geometry/topology";
 import {
@@ -19,7 +19,10 @@ interface RenderContext {
   draftPoints?: Point[];
   snapPreview?: SnapTarget | null;
   intersectionPreview?: Point[];
-  debugMode?: boolean;
+  debug?: DebugSettings;
+  selectedEdgeId?: string | null;
+  selectedJunctionBlockId?: string | null;
+  isolatedJunctionBlockId?: string | null;
 }
 
 export interface BandBucket {
@@ -30,11 +33,16 @@ export interface BandBucket {
 export interface RoadBandData {
   bandBuckets: Map<string, BandBucket>;
   junctions: JunctionAnalysis[];
+  junctionBlocks: JunctionBlock[];
   junctionPatches: JunctionPatch[];
   laneConnectorPatches: LaneConnectorPatch[];
+  virtualMouthLines: CarriagewayVirtualMouthLine[];
   laneStops: Array<{
     chainId: string;
+    junctionBlockId?: string;
     nodeId: string;
+    bandId: string;
+    kind: "node" | "connector";
     point: Point;
     distance: number;
   }>;
@@ -56,9 +64,18 @@ export interface RoadBandData {
   warnings: string[];
 }
 
+export type RoadSegmentGeometry = RoadBandData["edgeCenterlines"][number];
+
+export interface RoadNetworkGeometry {
+  roadSegments: RoadSegmentGeometry[];
+  junctionBlocks: JunctionBlock[];
+  warnings: string[];
+}
+
 const EPS = 1e-9;
 const JUNCTION_EDGE_TRIM_MIN = 18;
 const JUNCTION_EDGE_TRIM_FACTOR = 1.45;
+const JUNCTION_MOUTH_OVERLAP = 0.75;
 const JUNCTION_STYLE: Record<
   JunctionType,
   { text: string; fill: string; fillText: string; stroke: string; border: string }
@@ -93,6 +110,8 @@ const JUNCTION_STYLE: Record<
   },
 };
 
+type ProfileMap = Map<string, { carriagewayWidth: number; facilityWidth: number; sidewalkWidth: number; clearanceWidth: number }>;
+
 function indexNodes(scene: RoadPenScene): Map<string, SceneNode> {
   const map = new Map<string, SceneNode>();
   for (const node of scene.nodes) {
@@ -110,6 +129,24 @@ function nodeDegreeMap(scene: RoadPenScene): Map<string, number> {
   return map;
 }
 
+function profileMapFromScene(scene: RoadPenScene): ProfileMap {
+  const profileMap: ProfileMap = new Map();
+  for (const profile of scene.profiles) {
+    profileMap.set(profile.id, {
+      carriagewayWidth: profile.carriagewayWidth,
+      facilityWidth: profile.facilityWidth,
+      sidewalkWidth: profile.sidewalkWidth,
+      clearanceWidth: profile.clearanceWidth,
+    });
+  }
+  return profileMap;
+}
+
+function maxProfileOffsetForEdge(edge: RoadEdge, profileMap: ProfileMap): number {
+  const bands = buildLaneBandsForProfile(edge.profileId, profileMap);
+  return Math.max(0, ...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
+}
+
 function addPoint(a: Point, b: Point): Point {
   return { x: a.x + b.x, y: a.y + b.y };
 }
@@ -120,6 +157,16 @@ function subPoint(a: Point, b: Point): Point {
 
 function scalePoint(point: Point, value: number): Point {
   return { x: point.x * value, y: point.y * value };
+}
+
+function movePointToward(point: Point, target: Point, amount: number): Point {
+  const vector = subPoint(target, point);
+  const len = Math.hypot(vector.x, vector.y);
+  if (len <= EPS || amount <= 0) {
+    return { ...point };
+  }
+  const step = Math.min(amount, len * 0.45);
+  return addPoint(point, scalePoint(vector, step / len));
 }
 
 function unitPoint(point: Point): Point | null {
@@ -204,12 +251,14 @@ const PASS_THROUGH_DOT = -0.82;
 const LANE_STOP_MIN_SPAN = 8;
 
 interface LaneStopCandidate {
+  junctionBlockId: string | undefined;
   nodeId: string;
   point: Point;
   kind: "node" | "connector";
 }
 
 interface ProjectedLaneStop {
+  junctionBlockId: string | undefined;
   nodeId: string;
   point: Point;
   distanceAlong: number;
@@ -218,10 +267,17 @@ interface ProjectedLaneStop {
 }
 
 interface ConnectorStopEntry {
+  junctionBlockId: string;
   edgeId: string;
   point: Point;
   baseLane: LaneBase;
   side: BranchSide;
+}
+
+interface JunctionMouthEntry {
+  junctionBlockId: string;
+  edgeId: string;
+  point: Point;
 }
 
 function laneBaseForBand(band: LaneBand): LaneBase | null {
@@ -462,6 +518,7 @@ function visibleLaneSpansAroundStops(
       const stopDistance = defaultStopDistance;
       return projected && projected.distanceToPath <= Math.max(2, stopDistance * 0.6)
         ? {
+            junctionBlockId: stop.junctionBlockId,
             nodeId: stop.nodeId,
             point: projected.point,
             distanceAlong: projected.distanceAlong,
@@ -641,6 +698,10 @@ function appendChainPoints(out: Point[], points: Point[]): void {
   }
 }
 
+function pointKey(point: Point): string {
+  return `${point.x.toFixed(6)},${point.y.toFixed(6)}`;
+}
+
 export function buildVisualChains(scene: RoadPenScene): {
   chains: VisualChain[];
   continuationPairs: ContinuationPair[];
@@ -723,52 +784,35 @@ export function buildVisualChains(scene: RoadPenScene): {
   return { chains, continuationPairs };
 }
 
-function removePassThroughJunctionPoints(
-  points: Point[],
+function junctionTurnSkipIndices(
   chain: VisualChain,
   nodeMap: Map<string, SceneNode>,
   degrees: Map<string, number>,
-): Point[] {
+  points: Point[],
+): Set<number> {
+  const skip = new Set<number>();
   if (points.length < 3 || chain.nodeIds.length < 3) {
-    return points.map((point) => ({ ...point }));
+    return skip;
   }
 
-  const passThroughNodes = new Set(
+  const junctionPointKeys = new Set(
     chain.nodeIds
       .slice(1, -1)
       .filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3)
       .map((nodeId) => {
         const node = nodeMap.get(nodeId);
-        return node ? `${node.x.toFixed(6)},${node.y.toFixed(6)}` : "";
+        return node ? pointKey(node) : "";
       })
       .filter(Boolean),
   );
 
-  if (passThroughNodes.size === 0) {
-    return points.map((point) => ({ ...point }));
-  }
-
-  const out: Point[] = [];
-  for (let i = 0; i < points.length; i += 1) {
-    const point = points[i];
-    const key = `${point.x.toFixed(6)},${point.y.toFixed(6)}`;
-    const canRemove = i > 0 && i < points.length - 1 && passThroughNodes.has(key);
-    if (!canRemove) {
-      out.push({ ...point });
-      continue;
-    }
-
-    const prev = points[i - 1];
-    const next = points[i + 1];
-    const incoming = unitPoint(subPoint(point, prev));
-    const outgoing = unitPoint(subPoint(next, point));
-    if (!incoming || !outgoing || dotPoint(incoming, outgoing) < Math.abs(PASS_THROUGH_DOT)) {
-      out.push({ ...point });
-      continue;
+  for (let i = 1; i < points.length - 1; i += 1) {
+    if (junctionPointKeys.has(pointKey(points[i]))) {
+      skip.add(i);
     }
   }
 
-  return out.length >= 2 ? out : points.map((point) => ({ ...point }));
+  return skip;
 }
 
 function addDeadEndCaps(
@@ -1063,94 +1107,201 @@ function drawDebugLabel(ctx: CanvasRenderingContext2D, text: string, point: Poin
   ctx.restore();
 }
 
-function drawDebugOverlay(ctx: CanvasRenderingContext2D, data: RoadBandData): void {
+function drawDebugOverlay(ctx: CanvasRenderingContext2D, data: RoadBandData, debug: DebugSettings): void {
   ctx.save();
   ctx.globalAlpha = 0.92;
 
-  for (const patch of data.junctionPatches) {
-    drawDebugPolygon(ctx, patch.polygon, patch.kind === "mouth" ? "#fb923c" : "#facc15", patch.kind === "mouth" ? [2, 2] : [5, 3]);
-  }
-
-  for (const patch of data.laneConnectorPatches) {
-    drawDebugPolygon(ctx, patch.polygon, "#22c55e", [3, 3]);
-  }
-
-  for (const chain of data.edgeCenterlines) {
-    drawDebugPolyline(ctx, chain.rawPoints, "#ef4444", [7, 4]);
-    drawDebugPolyline(ctx, chain.sourcePoints, "#facc15", [3, 3]);
-    drawDebugPolyline(ctx, chain.renderPoints, "#38bdf8");
-
-    chain.rawPoints.forEach((point, index) => {
-      ctx.beginPath();
-      ctx.fillStyle = "#f97316";
-      ctx.strokeStyle = "#fff7ed";
-      ctx.lineWidth = 1;
-      ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-
-      drawDebugLabel(ctx, `${chain.id} raw p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}`, point, "#fed7aa");
-    });
-
-    chain.sourcePoints.forEach((point, index) => {
-      const turn = chain.turns.find((item) => item.idx === index);
-      if (!turn) {
-        return;
-      }
-      ctx.beginPath();
-      ctx.fillStyle = "#facc15";
-      ctx.strokeStyle = "#fff7ed";
-      ctx.lineWidth = 1;
-      ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+  if (debug.layers.junctionSurface) {
+    for (const block of data.junctionBlocks) {
       drawDebugLabel(
         ctx,
-        `${chain.id} turn p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}\nr=${turn.radius.toFixed(1)} ell=${turn.ell.toFixed(1)} d=${turn.deltaDeg.toFixed(0)}`,
-        point,
-        "#fde68a",
+        `${block.id}\n${block.type} deg ${block.degree}\nmouth ${block.mouthLines.length} / connectors ${block.laneConnectorPatches.length}`,
+        block.point,
+        "#bfdbfe",
       );
-    });
+    }
 
-    if (chain.rawPoints.length > 0) {
-      drawDebugLabel(ctx, `${chain.id}\nedges=${chain.edgeIds.join("+")}\nraw red / source yellow / render cyan`, chain.rawPoints[0], "#bae6fd");
+    for (const patch of data.junctionPatches) {
+      const color = patch.kind === "mouth" ? "#fb923c" : patch.kind === "virtual-boundary" ? "#38bdf8" : "#facc15";
+      const dash = patch.kind === "mouth" ? [2, 2] : patch.kind === "virtual-boundary" ? [8, 3] : [5, 3];
+      drawDebugPolygon(ctx, patch.polygon, color, dash);
+    }
+
+    for (const line of data.virtualMouthLines) {
+      drawDebugPolyline(ctx, [line.innerPoint, line.outerPoint], "#38bdf8", [3, 2]);
+      ctx.beginPath();
+      ctx.fillStyle = "#bae6fd";
+      ctx.arc(line.centerPoint.x, line.centerPoint.y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
-  for (const junction of data.junctions) {
-    if (junction.degree < 3) {
-      continue;
-    }
-    ctx.beginPath();
-    ctx.strokeStyle = junction.type === "cross" ? "#fb923c" : "#e879f9";
-    ctx.lineWidth = 1.5;
-    ctx.arc(junction.point.x, junction.point.y, 16, 0, Math.PI * 2);
-    ctx.stroke();
-
-    for (const branch of junction.branches) {
-      const end = addPoint(junction.point, scalePoint(branch.direction, 34));
-      drawDebugPolyline(ctx, [junction.point, end], "#a78bfa", [2, 3]);
-      drawDebugLabel(ctx, branch.edgeId, end, "#ddd6fe");
+  if (debug.layers.laneConnectors) {
+    for (const patch of data.laneConnectorPatches) {
+      drawDebugPolygon(ctx, patch.polygon, "#22c55e", [3, 3]);
     }
   }
 
-  for (const stop of data.laneStops) {
-    ctx.beginPath();
-    ctx.fillStyle = "rgba(244, 114, 182, 0.9)";
-    ctx.strokeStyle = "#fce7f3";
-    ctx.lineWidth = 1.5;
-    ctx.arc(stop.point.x, stop.point.y, 6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.strokeStyle = "rgba(244, 114, 182, 0.7)";
-    ctx.setLineDash([4, 3]);
-    ctx.arc(stop.point.x, stop.point.y, stop.distance, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    drawDebugLabel(ctx, `lane stop\n${stop.chainId} ${stop.nodeId}\nd=${stop.distance.toFixed(1)}`, stop.point, "#fbcfe8");
+  if (debug.layers.roadSkeleton) {
+    for (const chain of data.edgeCenterlines) {
+      drawDebugPolyline(ctx, chain.rawPoints, "#ef4444", [7, 4]);
+      drawDebugPolyline(ctx, chain.sourcePoints, "#facc15", [3, 3]);
+      drawDebugPolyline(ctx, chain.renderPoints, "#38bdf8");
+
+      chain.rawPoints.forEach((point, index) => {
+        ctx.beginPath();
+        ctx.fillStyle = "#f97316";
+        ctx.strokeStyle = "#fff7ed";
+        ctx.lineWidth = 1;
+        ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        drawDebugLabel(ctx, `${chain.id} raw p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}`, point, "#fed7aa");
+      });
+
+      chain.sourcePoints.forEach((point, index) => {
+        const turn = chain.turns.find((item) => item.idx === index);
+        if (!turn) {
+          return;
+        }
+        ctx.beginPath();
+        ctx.fillStyle = "#facc15";
+        ctx.strokeStyle = "#fff7ed";
+        ctx.lineWidth = 1;
+        ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        drawDebugLabel(
+          ctx,
+          `${chain.id} turn p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}\nr=${turn.radius.toFixed(1)} ell=${turn.ell.toFixed(1)} d=${turn.deltaDeg.toFixed(0)}`,
+          point,
+          "#fde68a",
+        );
+      });
+
+      if (chain.rawPoints.length > 0) {
+        drawDebugLabel(ctx, `${chain.id}\nedges=${chain.edgeIds.join("+")}\nraw red / source yellow / render cyan`, chain.rawPoints[0], "#bae6fd");
+      }
+    }
   }
 
+  if (debug.layers.junctionBranches) {
+    for (const junction of data.junctions) {
+      if (junction.degree < 3) {
+        continue;
+      }
+      ctx.beginPath();
+      ctx.strokeStyle = junction.type === "cross" ? "#fb923c" : "#e879f9";
+      ctx.lineWidth = 1.5;
+      ctx.arc(junction.point.x, junction.point.y, 16, 0, Math.PI * 2);
+      ctx.stroke();
+
+      for (const branch of junction.branches) {
+        const end = addPoint(junction.point, scalePoint(branch.direction, 34));
+        drawDebugPolyline(ctx, [junction.point, end], "#a78bfa", [2, 3]);
+        drawDebugLabel(ctx, branch.edgeId, end, "#ddd6fe");
+      }
+    }
+  }
+
+  if (debug.layers.laneStops) {
+    for (const stop of data.laneStops) {
+      ctx.beginPath();
+      ctx.fillStyle = "rgba(244, 114, 182, 0.9)";
+      ctx.strokeStyle = "#fce7f3";
+      ctx.lineWidth = 1.5;
+      ctx.arc(stop.point.x, stop.point.y, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(244, 114, 182, 0.7)";
+      ctx.setLineDash([4, 3]);
+      ctx.arc(stop.point.x, stop.point.y, stop.distance, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      drawDebugLabel(
+        ctx,
+        `lane stop\n${stop.junctionBlockId ?? "no-block"}\n${stop.chainId} ${stop.nodeId}\n${stop.bandId} ${stop.kind}\nd=${stop.distance.toFixed(1)}`,
+        stop.point,
+        "#fbcfe8",
+      );
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawSelectedRoad(ctx: CanvasRenderingContext2D, scene: RoadPenScene, selectedEdgeId: string | null | undefined): void {
+  if (!selectedEdgeId) {
+    return;
+  }
+
+  const edge = scene.edges.find((item) => item.id === selectedEdgeId);
+  if (!edge || edge.controlPoints.length < 2) {
+    return;
+  }
+
+  const profileMap = profileMapFromScene(scene);
+  const radius = maxProfileOffsetForEdge(edge, profileMap);
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  ctx.beginPath();
+  ctx.moveTo(edge.controlPoints[0].x, edge.controlPoints[0].y);
+  for (const point of edge.controlPoints.slice(1)) {
+    ctx.lineTo(point.x, point.y);
+  }
+  ctx.strokeStyle = "rgba(14, 165, 233, 0.2)";
+  ctx.lineWidth = Math.max(12, radius * 2 + 12);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(edge.controlPoints[0].x, edge.controlPoints[0].y);
+  for (const point of edge.controlPoints.slice(1)) {
+    ctx.lineTo(point.x, point.y);
+  }
+  ctx.strokeStyle = "#fde047";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([9, 5]);
+  ctx.stroke();
+  ctx.restore();
+}
+
+export function buildJunctionOnlyBandBuckets(data: RoadBandData, junctionBlockId: string): Map<string, BandBucket> {
+  const buckets = new Map<string, BandBucket>();
+  const block = data.junctionBlocks.find((item) => item.id === junctionBlockId);
+  if (!block) {
+    return buckets;
+  }
+
+  for (const patch of block.surfacePatches) {
+    addBandPolygon(buckets, patch.band, patch.polygon);
+  }
+  for (const patch of block.laneConnectorPatches) {
+    addBandPolygon(buckets, patch.band, patch.polygon);
+  }
+  return buckets;
+}
+
+function drawSelectedJunctionBlock(ctx: CanvasRenderingContext2D, block: JunctionBlock | null | undefined): void {
+  if (!block) {
+    return;
+  }
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(253, 224, 71, 0.95)";
+  ctx.lineWidth = 2.5;
+  ctx.setLineDash([8, 4]);
+  for (const patch of [...block.surfacePatches, ...block.laneConnectorPatches]) {
+    drawDebugPolygon(ctx, patch.polygon, "rgba(253, 224, 71, 0.95)", [8, 4]);
+  }
+  ctx.setLineDash([]);
+  ctx.fillStyle = "rgba(253, 224, 71, 0.95)";
+  ctx.beginPath();
+  ctx.arc(block.point.x, block.point.y, 5, 0, Math.PI * 2);
+  ctx.fill();
   ctx.restore();
 }
 
@@ -1163,23 +1314,33 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   const laneStopDebugKeys = new Set<string>();
   const warnings = new Set<string>();
 
-  const profileMap = new Map<string, { carriagewayWidth: number; facilityWidth: number; sidewalkWidth: number; clearanceWidth: number }>();
-  for (const profile of scene.profiles) {
-    profileMap.set(profile.id, {
-      carriagewayWidth: profile.carriagewayWidth,
-      facilityWidth: profile.facilityWidth,
-      sidewalkWidth: profile.sidewalkWidth,
-      clearanceWidth: profile.clearanceWidth,
-    });
-  }
+  const profileMap = profileMapFromScene(scene);
 
   const junctionGeometry = buildJunctionGeometry(scene, profileMap);
   const connectorStopsByNode = new Map<string, ConnectorStopEntry[]>();
-  for (const patch of junctionGeometry.laneConnectorPatches) {
-    const stops = connectorStopsByNode.get(patch.nodeId) ?? [];
-    stops.push({ edgeId: patch.fromEdgeId, point: { ...patch.fromStopPoint }, baseLane: patch.baseLane, side: "left" });
-    stops.push({ edgeId: patch.toEdgeId, point: { ...patch.toStopPoint }, baseLane: patch.baseLane, side: "right" });
-    connectorStopsByNode.set(patch.nodeId, stops);
+  const mouthStopsByNode = new Map<string, JunctionMouthEntry[]>();
+  for (const block of junctionGeometry.junctionBlocks) {
+    for (const stop of block.laneStops) {
+      const stops = connectorStopsByNode.get(stop.nodeId) ?? [];
+      stops.push({
+        junctionBlockId: stop.junctionBlockId,
+        edgeId: stop.edgeId,
+        point: { ...stop.point },
+        baseLane: stop.baseLane,
+        side: stop.side,
+      });
+      connectorStopsByNode.set(stop.nodeId, stops);
+    }
+
+    for (const line of block.mouthLines) {
+      const stops = mouthStopsByNode.get(line.nodeId) ?? [];
+      stops.push({
+        junctionBlockId: line.junctionBlockId,
+        edgeId: line.edgeId,
+        point: { ...line.centerPoint },
+      });
+      mouthStopsByNode.set(line.nodeId, stops);
+    }
   }
   const { chains: visualChains } = buildVisualChains(scene);
   for (const warning of junctionGeometry.warnings) {
@@ -1203,12 +1364,14 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
 
     const maxOffset = Math.max(...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
     const rawCenterline = chain.points.map((p) => ({ ...p }));
-    const sourceCenterline = removePassThroughJunctionPoints(rawCenterline, chain, nodeMap, degrees);
+    const sourceCenterline = rawCenterline.map((point) => ({ ...point }));
+    const skipTurnIndices = junctionTurnSkipIndices(chain, nodeMap, degrees, sourceCenterline);
     const splineTurnOptions = {
       angleThresholdDeg: 6,
       radiusFactor: 2.2,
       clampRatio: 0.45,
       minInnerRadius: 0.4,
+      skipTurnIndices,
     };
     const usesSmoothCenterline = sourceCenterline.length > 2;
     const turns = computeTurnSpecs(sourceCenterline, maxOffset, splineTurnOptions);
@@ -1222,27 +1385,47 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     const defaultLaneStopDistance = Math.max(18, maxOffset * 1.1);
     const junctionNodeIds = [...new Set(chain.nodeIds)].filter((nodeId) => (degrees.get(nodeId) ?? 0) >= 3);
     const chainEdgeIds = new Set(chain.edgeIds);
+    const mouthStopsForCarriageway = (): LaneStopCandidate[] =>
+      junctionNodeIds.flatMap((nodeId) => {
+        const node = nodeMap.get(nodeId);
+        if (!node) {
+          return [];
+        }
+        const stops = (mouthStopsByNode.get(nodeId) ?? [])
+          .filter((stop) => chainEdgeIds.has(stop.edgeId))
+          .map((stop) => ({
+            junctionBlockId: stop.junctionBlockId,
+            nodeId,
+            point: movePointToward(stop.point, node, JUNCTION_MOUTH_OVERLAP),
+            kind: "connector" as const,
+          }));
+        return stops.length > 0
+          ? [{ junctionBlockId: stops[0].junctionBlockId, nodeId, point: { x: node.x, y: node.y }, kind: "node" as const }, ...stops]
+          : [];
+      });
     const laneStopsForBand = (band: LaneBand): LaneStopCandidate[] =>
       junctionNodeIds.flatMap((nodeId) => {
         const node = nodeMap.get(nodeId);
         if (!node) {
           return [];
         }
-        const stops: LaneStopCandidate[] = [{ nodeId, point: { x: node.x, y: node.y }, kind: "node" }];
         const base = laneBaseForBand(band);
         if (!base) {
-          return stops;
+          return [];
         }
+        const connectorStops: LaneStopCandidate[] = [];
         for (const stop of connectorStopsByNode.get(nodeId) ?? []) {
           if (
             chainEdgeIds.has(stop.edgeId) &&
             stop.baseLane === base &&
             chainBandSideAtNode(chain, nodeId, stop.edgeId, band) === stop.side
           ) {
-            stops.push({ nodeId, point: { ...stop.point }, kind: "connector" });
+            connectorStops.push({ junctionBlockId: stop.junctionBlockId, nodeId, point: { ...stop.point }, kind: "connector" });
           }
         }
-        return stops;
+        return connectorStops.length > 0
+          ? [{ junctionBlockId: connectorStops[0].junctionBlockId, nodeId, point: { x: node.x, y: node.y }, kind: "node" }, ...connectorStops]
+          : [];
       });
     edgeCenterlines.push({
       id: chain.id,
@@ -1271,6 +1454,32 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     }
 
     for (const band of bands) {
+      if (band.id === "carriageway") {
+        const stoppedSpans = visibleLaneSpansAroundStops(centerline, mouthStopsForCarriageway(), defaultLaneStopDistance);
+        for (const stop of stoppedSpans.stops) {
+          const key = `${chain.id}:${band.id}:${stop.nodeId}:${stop.point.x.toFixed(2)}:${stop.point.y.toFixed(2)}`;
+          if (!laneStopDebugKeys.has(key)) {
+            laneStopDebugKeys.add(key);
+            laneStops.push({
+              chainId: chain.id,
+              junctionBlockId: stop.junctionBlockId,
+              nodeId: stop.nodeId,
+              bandId: band.id,
+              kind: stop.kind,
+              point: { ...stop.point },
+              distance: stop.stopDistance,
+            });
+          }
+        }
+        for (const span of stoppedSpans.spans) {
+          const polygon = buildSmoothBandPolygon(span, band.qInner, band.qOuter);
+          if (polygon.length >= 3) {
+            addBandPolygon(bandBuckets, band, polygon);
+          }
+        }
+        continue;
+      }
+
       if (isOuterLaneBand(band)) {
         const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, laneStopsForBand(band), defaultLaneStopDistance);
         for (const stop of stoppedLaneSpans.stops) {
@@ -1279,7 +1488,10 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
             laneStopDebugKeys.add(key);
             laneStops.push({
               chainId: chain.id,
+              junctionBlockId: stop.junctionBlockId,
               nodeId: stop.nodeId,
+              bandId: band.id,
+              kind: stop.kind,
               point: { ...stop.point },
               distance: stop.stopDistance,
             });
@@ -1331,11 +1543,22 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
   return {
     bandBuckets,
     junctions: junctionGeometry.junctions,
+    junctionBlocks: junctionGeometry.junctionBlocks,
     junctionPatches: junctionGeometry.patches,
     laneConnectorPatches: junctionGeometry.laneConnectorPatches,
+    virtualMouthLines: junctionGeometry.virtualMouthLines,
     laneStops,
     edgeCenterlines,
     warnings: [...warnings],
+  };
+}
+
+export function buildRoadNetworkGeometry(scene: RoadPenScene): RoadNetworkGeometry {
+  const data = buildRoadBandPolygons(scene);
+  return {
+    roadSegments: data.edgeCenterlines,
+    junctionBlocks: data.junctionBlocks,
+    warnings: data.warnings,
   };
 }
 
@@ -1344,12 +1567,13 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     return [];
   }
 
-  const { width, height, draftPoints, snapPreview, intersectionPreview, debugMode } = params;
+  const { width, height, draftPoints, snapPreview, intersectionPreview, debug, selectedEdgeId, selectedJunctionBlockId, isolatedJunctionBlockId } = params;
   ctx.clearRect(0, 0, width, height);
 
   const roadData = buildRoadBandPolygons(scene);
   const { bandBuckets, junctions, warnings: geometryWarnings } = roadData;
-  const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
+  const visibleBandBuckets = isolatedJunctionBlockId ? buildJunctionOnlyBandBuckets(roadData, isolatedJunctionBlockId) : bandBuckets;
+  const orderedBands = [...visibleBandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   for (const bucket of orderedBands) {
     const merged = mergeRoadJunction(bucket.polygons);
@@ -1369,9 +1593,18 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     }
   }
 
-  drawJunctionLabels(ctx, junctions);
-  if (debugMode) {
-    drawDebugOverlay(ctx, roadData);
+  drawSelectedRoad(ctx, scene, selectedEdgeId);
+  const selectedBlockId = isolatedJunctionBlockId ?? selectedJunctionBlockId;
+  const selectedBlock = selectedBlockId ? roadData.junctionBlocks.find((block) => block.id === selectedBlockId) : null;
+  drawSelectedJunctionBlock(ctx, selectedBlock);
+  drawJunctionLabels(
+    ctx,
+    isolatedJunctionBlockId
+      ? junctions.filter((junction) => `junction-${junction.nodeId}` === isolatedJunctionBlockId)
+      : junctions,
+  );
+  if (debug?.enabled) {
+    drawDebugOverlay(ctx, roadData, debug);
   }
   drawSnapPreview(ctx, scene, snapPreview);
   drawIntersectionPreview(ctx, intersectionPreview);

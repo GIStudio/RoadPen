@@ -66,7 +66,7 @@ function sceneMeta(scene: RoadPenScene, junctions: Array<{ nodeId: string; type:
 
 export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): string {
   const { width, height, draftPoints } = options;
-  const { bandBuckets, junctions, junctionPatches, laneConnectorPatches, laneStops, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
+  const { bandBuckets, junctions, junctionPatches, laneConnectorPatches, virtualMouthLines, laneStops, edgeCenterlines, warnings } = buildRoadBandPolygons(scene);
   const orderedBands = [...bandBuckets.values()].sort((a, b) => a.band.zIndex - b.band.zIndex);
 
   const out: string[] = [
@@ -121,8 +121,23 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
   );
 
   junctionPatches.forEach((patch, index) => {
+    const turnAttrs =
+      patch.kind === "turn"
+        ? `${patch.fromEdgeId ? ` data-from-edge-id="${esc(patch.fromEdgeId)}"` : ""}${patch.toEdgeId ? ` data-to-edge-id="${esc(patch.toEdgeId)}"` : ""}${patch.directed ? ' data-directed="true"' : ""}`
+        : "";
     out.push(
-      `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" data-kind="${esc(patch.kind ?? "unknown")}" d="${ringToPath(patch.polygon)}"/>`,
+      `    <path id="junction-patch-${esc(patch.nodeId)}-${esc(patch.bandId)}-${index}" data-junction-block-id="${esc(patch.junctionBlockId)}" data-node-id="${esc(patch.nodeId)}" data-junction-type="${patch.type}" data-band="${esc(patch.bandId)}" data-kind="${esc(patch.kind ?? "unknown")}"${turnAttrs} d="${ringToPath(patch.polygon)}"/>`,
+    );
+  });
+
+  out.push(
+    "  </g>",
+    '  <g id="virtual-mouth-lines" opacity="0.75" fill="none" stroke="#38bdf8" stroke-width="1.4" stroke-dasharray="3 2">',
+  );
+
+  virtualMouthLines.forEach((line, index) => {
+    out.push(
+      `    <line id="virtual-mouth-${esc(line.nodeId)}-${esc(line.edgeId)}-${index}" data-junction-block-id="${esc(line.junctionBlockId)}" data-node-id="${esc(line.nodeId)}" data-edge-id="${esc(line.edgeId)}" data-junction-type="${line.type}" data-band="${esc(line.bandId)}" data-kind="virtual-boundary" x1="${fmt(line.innerPoint.x)}" y1="${fmt(line.innerPoint.y)}" x2="${fmt(line.outerPoint.x)}" y2="${fmt(line.outerPoint.y)}"/>`,
     );
   });
 
@@ -133,7 +148,7 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
 
   laneConnectorPatches.forEach((patch, index) => {
     out.push(
-      `    <path id="lane-connector-${esc(patch.nodeId)}-${esc(patch.baseLane)}-${index}" data-node-id="${esc(patch.nodeId)}" data-base-lane="${esc(patch.baseLane)}" data-from-edge-id="${esc(patch.fromEdgeId)}" data-to-edge-id="${esc(patch.toEdgeId)}" d="${ringToPath(patch.polygon)}"/>`,
+      `    <path id="lane-connector-${esc(patch.nodeId)}-${esc(patch.baseLane)}-${index}" data-junction-block-id="${esc(patch.junctionBlockId)}" data-node-id="${esc(patch.nodeId)}" data-base-lane="${esc(patch.baseLane)}" data-from-edge-id="${esc(patch.fromEdgeId)}" data-to-edge-id="${esc(patch.toEdgeId)}" d="${ringToPath(patch.polygon)}"/>`,
     );
   });
 
@@ -144,7 +159,7 @@ export function exportRoadSvg(scene: RoadPenScene, options: SvgExportOptions): s
 
   laneStops.forEach((stop, index) => {
     out.push(
-      `    <circle id="lane-stop-${esc(stop.chainId)}-${esc(stop.nodeId)}-${index}" data-chain-id="${esc(stop.chainId)}" data-node-id="${esc(stop.nodeId)}" data-distance="${fmt(stop.distance)}" cx="${fmt(stop.point.x)}" cy="${fmt(stop.point.y)}" r="4"/>`,
+      `    <circle id="lane-stop-${esc(stop.chainId)}-${esc(stop.nodeId)}-${index}" data-chain-id="${esc(stop.chainId)}"${stop.junctionBlockId ? ` data-junction-block-id="${esc(stop.junctionBlockId)}"` : ""} data-node-id="${esc(stop.nodeId)}" data-band-id="${esc(stop.bandId)}" data-kind="${esc(stop.kind)}" data-distance="${fmt(stop.distance)}" cx="${fmt(stop.point.x)}" cy="${fmt(stop.point.y)}" r="4"/>`,
     );
   });
 

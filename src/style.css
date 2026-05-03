@@ -137,3 +137,63 @@ body {
 .warning-list li + li {
   margin-top: 5px;
 }
+
+.debug-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.debug-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.debug-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.debug-row-caption {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.debug-layer-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.road-details {
+  width: 100%;
+}
+
+.debug-section-title {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.debug-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.debug-code {
+  margin: 6px 0 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px;
+  color: #dbeafe;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}

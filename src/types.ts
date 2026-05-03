@@ -67,21 +67,107 @@ export interface TurnSpec {
   warning?: string;
 }
 
+export const DEBUG_LAYER_KEYS = [
+  "junctionSurface",
+  "laneConnectors",
+  "roadSkeleton",
+  "junctionBranches",
+  "laneStops",
+] as const;
+
+export type DebugLayerKey = typeof DEBUG_LAYER_KEYS[number];
+
+export interface DebugSettings {
+  enabled: boolean;
+  layers: Record<DebugLayerKey, boolean>;
+  roadInspector: boolean;
+  junctionInspector: boolean;
+  isolateSelectedJunction: boolean;
+}
+
+export const DEFAULT_DEBUG_SETTINGS: DebugSettings = {
+  enabled: false,
+  layers: {
+    junctionSurface: true,
+    laneConnectors: true,
+    roadSkeleton: true,
+    junctionBranches: true,
+    laneStops: true,
+  },
+  roadInspector: false,
+  junctionInspector: false,
+  isolateSelectedJunction: false,
+};
+
+export interface RoadInspectorDetails {
+  edge: {
+    id: string;
+    from: string;
+    to: string;
+    geomType: GeometryType;
+    endMode: RoadEndMode;
+    profileId: string;
+    controlPointCount: number;
+    controlPoints: Point[];
+    length: number;
+  };
+  profile: LaneProfile | null;
+  visualChain: {
+    id: string;
+    edgeIds: string[];
+    rawPointCount: number;
+    sourcePointCount: number;
+    renderPointCount: number;
+    turnCount: number;
+  } | null;
+  endpoints: Array<{
+    nodeId: string;
+    junctionType: JunctionType | null;
+    degree: number;
+  }>;
+}
+
+export interface JunctionInspectorDetails {
+  id: string;
+  nodeId: string;
+  type: JunctionType;
+  degree: number;
+  point: Point;
+  branchCount: number;
+  mouthLineCount: number;
+  surfacePatchCount: number;
+  laneConnectorCount: number;
+  laneStopCount: number;
+  virtualBoundary: boolean;
+  branches: Array<{
+    edgeId: string;
+    profileId: string;
+    direction: Point;
+  }>;
+}
+
 export type ToolbarAction =
-  | "select"
-  | "draw"
-  | "finish"
-  | "export"
-  | "exportSvg"
-  | "import"
-  | "endFree"
-  | "endClosed"
-  | "toggleDebug";
+  | { type: "setMode"; mode: "select" | "draw" }
+  | { type: "finish" }
+  | { type: "export" }
+  | { type: "exportSvg" }
+  | { type: "import" }
+  | { type: "setEndMode"; endMode: RoadEndMode }
+  | { type: "setDebugPanelOpen"; open: boolean }
+  | { type: "setDebugEnabled"; enabled: boolean }
+  | { type: "setDebugLayer"; layer: DebugLayerKey; enabled: boolean }
+  | { type: "setRoadInspector"; enabled: boolean }
+  | { type: "setJunctionInspector"; enabled: boolean }
+  | { type: "setIsolateSelectedJunction"; enabled: boolean }
+  | { type: "clearJunctionSelection" };
 
 export interface ToolbarState {
   mode: "select" | "draw";
   endMode: RoadEndMode;
-  debugMode: boolean;
+  debug: DebugSettings;
+  debugPanelOpen: boolean;
+  selectedRoad: RoadInspectorDetails | null;
+  selectedJunction: JunctionInspectorDetails | null;
   draftPoints: number;
   warningCount: number;
   canFinish: boolean;

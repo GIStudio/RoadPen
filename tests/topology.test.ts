@@ -47,6 +47,26 @@ function horizontalScene(): RoadPenScene {
   );
 }
 
+function angledPassThroughTScene(): RoadPenScene {
+  return sceneWithEdges(
+    [
+      road("west-road", "center", "west", [{ x: 0, y: 0 }, { x: -100, y: 0 }]),
+      road("east-road", "center", "east", [{ x: 0, y: 0 }, { x: 100, y: 20 }]),
+      road("north-road", "center", "north", [{ x: 0, y: 0 }, { x: 0, y: -90 }]),
+    ],
+    [
+      { id: "center", x: 0, y: 0 },
+      { id: "west", x: -100, y: 0 },
+      { id: "east", x: 100, y: 20 },
+      { id: "north", x: 0, y: -90 },
+    ],
+  );
+}
+
+function hasPoint(points: Point[], target: Point): boolean {
+  return points.some((point) => Math.hypot(point.x - target.x, point.y - target.y) < 1e-6);
+}
+
 function idFactories(scene: RoadPenScene): { node: () => string; edge: () => string } {
   let nodeSerial = scene.nodes.length;
   let edgeSerial = scene.edges.length;
@@ -104,6 +124,20 @@ describe("topology", () => {
     expect(mainVisualChain).toBeDefined();
     expect(junction).toMatchObject({ type: "t", degree: 3 });
     expect(junctionPatches.some((patch) => patch.nodeId === junction?.nodeId && patch.bandId === "carriageway")).toBe(true);
+  });
+
+  test("T 路口穿越道路的 source/render 骨架应保留路口节点", () => {
+    const scene = angledPassThroughTScene();
+    const { edgeCenterlines } = buildRoadBandPolygons(scene);
+    const mainVisualChain = edgeCenterlines.find(
+      (chain) => chain.edgeIds.includes("west-road") && chain.edgeIds.includes("east-road"),
+    );
+
+    expect(mainVisualChain).toBeDefined();
+    expect(hasPoint(mainVisualChain?.rawPoints ?? [], { x: 0, y: 0 })).toBe(true);
+    expect(hasPoint(mainVisualChain?.sourcePoints ?? [], { x: 0, y: 0 })).toBe(true);
+    expect(hasPoint(mainVisualChain?.renderPoints ?? [], { x: 0, y: 0 })).toBe(true);
+    expect(mainVisualChain?.turns.some((turn) => Math.hypot(turn.point.x, turn.point.y) < 1e-6)).toBe(false);
   });
 
   test("新道路穿过旧道路时，应同时拆分新旧道路形成十字路口", () => {

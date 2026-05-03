@@ -3,12 +3,13 @@ import "antd/dist/reset.css";
 import * as G6 from "@antv/g6";
 import * as React from "react";
 import { createRoot } from "react-dom/client";
-import type { Point, RoadEndMode, RoadPenScene, SceneNode, ToolbarAction, ToolbarState } from "./types";
+import { DEFAULT_DEBUG_SETTINGS, type DebugSettings, type JunctionInspectorDetails, type Point, type RoadEndMode, type RoadInspectorDetails, type RoadPenScene, type SceneNode, type ToolbarAction, type ToolbarState } from "./types";
 import { exportScene, parseRoadPenScene } from "./io/io";
 import { exportRoadSvg } from "./io/svgExport";
-import { renderRoads } from "./render/roadRenderer";
+import { buildRoadBandPolygons, renderRoads } from "./render/roadRenderer";
 import { ToolbarApp } from "./ui/ToolbarApp";
 import { commitRoadWithTopology, findPathRoadIntersections, findSnapTarget, type DraftAnchor, type SnapTarget } from "./geometry/topology";
+import { findRoadAtPoint } from "./geometry/roadPicking";
 
 const CANVAS_BG = "#0a1024";
 const SNAP_RADIUS = 12;
@@ -33,7 +34,10 @@ interface AppState {
   snapPreview: SnapTarget | null;
   selectedEndMode: RoadEndMode;
   selectedProfileId: string;
-  debugMode: boolean;
+  debug: DebugSettings;
+  debugPanelOpen: boolean;
+  selectedEdgeId: string | null;
+  selectedJunctionBlockId: string | null;
 }
 
 const emptyScene: RoadPenScene = {
@@ -63,7 +67,10 @@ const app: AppState = {
   snapPreview: null,
   selectedEndMode: "free",
   selectedProfileId: DEFAULT_PROFILE_ID,
-  debugMode: false,
+  debug: structuredClone(DEFAULT_DEBUG_SETTINGS),
+  debugPanelOpen: false,
+  selectedEdgeId: null,
+  selectedJunctionBlockId: null,
 };
 
 let nodeSerial = 0;
@@ -159,6 +166,13 @@ function getCanvasPointFromEvent(event: any): Point {
   const clientY = parseNumber(fromEvent?.clientY);
   if (clientX !== null && clientY !== null && graph) {
     return graph.getCanvasByClient({ x: clientX, y: clientY });
+  }
+
+  const model = event?.item?.getModel?.();
+  const modelX = parseNumber(model?.x);
+  const modelY = parseNumber(model?.y);
+  if (modelX !== null && modelY !== null) {
+    return { x: modelX, y: modelY };
   }
 
   const fallbackX = parseNumber(event?.x);
@@ -305,11 +319,142 @@ function snapStatusText(): string | null {
   return `将拆分道路 ${app.snapPreview.edgeId} 形成 T 路口`;
 }
 
+function polylineLength(points: Point[]): number {
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  return total;
+}
+
+function selectedRoadDetails(): RoadInspectorDetails | null {
+  if (!app.selectedEdgeId) {
+    return null;
+  }
+
+  const edge = app.scene.edges.find((item) => item.id === app.selectedEdgeId);
+  if (!edge) {
+    return null;
+  }
+
+  const profile = app.scene.profiles.find((item) => item.id === edge.profileId) ?? null;
+  const roadData = buildRoadBandPolygons(app.scene);
+  const chain = roadData.edgeCenterlines.find((item) => item.edgeIds.includes(edge.id));
+  const endpoints = [edge.from, edge.to].map((nodeId) => {
+    const junction = roadData.junctions.find((item) => item.nodeId === nodeId);
+    return {
+      nodeId,
+      junctionType: junction?.type ?? null,
+      degree: junction?.degree ?? 0,
+    };
+  });
+
+  return {
+    edge: {
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      geomType: edge.geomType,
+      endMode: edge.endMode ?? "free",
+      profileId: edge.profileId,
+      controlPointCount: edge.controlPoints.length,
+      controlPoints: edge.controlPoints.map((point) => ({ ...point })),
+      length: polylineLength(edge.controlPoints),
+    },
+    profile: profile ? { ...profile } : null,
+    visualChain: chain
+      ? {
+          id: chain.id,
+          edgeIds: [...chain.edgeIds],
+          rawPointCount: chain.rawPoints.length,
+          sourcePointCount: chain.sourcePoints.length,
+          renderPointCount: chain.renderPoints.length,
+          turnCount: chain.turns.length,
+        }
+      : null,
+    endpoints,
+  };
+}
+
+function pointInPolygon(point: Point, polygon: Point[]): boolean {
+  const ring =
+    polygon.length > 1 &&
+    Math.abs(polygon[0].x - polygon[polygon.length - 1].x) < 1e-6 &&
+    Math.abs(polygon[0].y - polygon[polygon.length - 1].y) < 1e-6
+      ? polygon.slice(0, -1)
+      : polygon;
+
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i, i += 1) {
+    const a = ring[i];
+    const b = ring[j];
+    const intersects =
+      a.y > point.y !== b.y > point.y &&
+      point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y || 1e-9) + a.x;
+    if (intersects) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function selectedJunctionDetails(): JunctionInspectorDetails | null {
+  if (!app.selectedJunctionBlockId) {
+    return null;
+  }
+
+  const roadData = buildRoadBandPolygons(app.scene);
+  const block = roadData.junctionBlocks.find((item) => item.id === app.selectedJunctionBlockId);
+  if (!block) {
+    return null;
+  }
+
+  return {
+    id: block.id,
+    nodeId: block.nodeId,
+    type: block.type,
+    degree: block.degree,
+    point: { ...block.point },
+    branchCount: block.branches.length,
+    mouthLineCount: block.mouthLines.length,
+    surfacePatchCount: block.surfacePatches.length,
+    laneConnectorCount: block.laneConnectorPatches.length,
+    laneStopCount: block.laneStops.length,
+    virtualBoundary: Boolean(block.virtualBoundary),
+    branches: block.branches.map((branch) => ({
+      edgeId: branch.edgeId,
+      profileId: branch.profileId,
+      direction: { ...branch.direction },
+    })),
+  };
+}
+
+function findJunctionBlockAtPoint(point: Point): string | null {
+  const roadData = buildRoadBandPolygons(app.scene);
+  let nearest: { id: string; distance: number } | null = null;
+
+  for (const block of roadData.junctionBlocks) {
+    const hitSurface = [...block.surfacePatches, ...block.laneConnectorPatches].some((patch) => pointInPolygon(point, patch.polygon));
+    const centerDistance = Math.hypot(block.point.x - point.x, block.point.y - point.y);
+    if (!hitSurface && centerDistance > 22) {
+      continue;
+    }
+    if (!nearest || centerDistance < nearest.distance) {
+      nearest = { id: block.id, distance: centerDistance };
+    }
+  }
+
+  return nearest?.id ?? null;
+}
+
 function emitToolbarState(): void {
   const nextState: ToolbarState = {
     mode: app.mode,
     endMode: app.selectedEndMode,
-    debugMode: app.debugMode,
+    debug: structuredClone(app.debug),
+    debugPanelOpen: app.debugPanelOpen,
+    selectedRoad: selectedRoadDetails(),
+    selectedJunction: selectedJunctionDetails(),
     draftPoints: app.draftPoints.length,
     warningCount: sceneWarnings.length,
     canFinish: app.mode === "draw" && app.draftPoints.length >= 2,
@@ -322,46 +467,69 @@ function emitToolbarState(): void {
 }
 
 function handleToolbarAction(action: ToolbarAction): void {
-  if (action === "select") {
-    switchMode("select");
-    return;
-  }
-  if (action === "draw") {
-    switchMode("draw");
-    return;
-  }
-  if (action === "finish") {
-    if (app.mode === "draw") {
-      finishDraft();
-    }
-    return;
-  }
-  if (action === "export") {
-    exportToFile();
-    return;
-  }
-  if (action === "exportSvg") {
-    exportSvgToFile();
-    return;
-  }
-  if (action === "import") {
-    importInput.value = "";
-    importInput.click();
-    return;
-  }
-  if (action === "endFree") {
-    app.selectedEndMode = "free";
-    requestRender();
-    return;
-  }
-  if (action === "endClosed") {
-    app.selectedEndMode = "closed";
-    requestRender();
-    return;
-  }
-  if (action === "toggleDebug") {
-    app.debugMode = !app.debugMode;
-    requestRender();
+  switch (action.type) {
+    case "setMode":
+      switchMode(action.mode);
+      return;
+    case "finish":
+      if (app.mode === "draw") {
+        finishDraft();
+      }
+      return;
+    case "export":
+      exportToFile();
+      return;
+    case "exportSvg":
+      exportSvgToFile();
+      return;
+    case "import":
+      importInput.value = "";
+      importInput.click();
+      return;
+    case "setEndMode":
+      app.selectedEndMode = action.endMode;
+      requestRender();
+      return;
+    case "setDebugPanelOpen":
+      app.debugPanelOpen = action.open;
+      requestRender();
+      return;
+    case "setDebugEnabled":
+      app.debug = { ...app.debug, enabled: action.enabled };
+      requestRender();
+      return;
+    case "setDebugLayer":
+      app.debug = {
+        ...app.debug,
+        layers: {
+          ...app.debug.layers,
+          [action.layer]: action.enabled,
+        },
+      };
+      requestRender();
+      return;
+    case "setRoadInspector":
+      app.debug = { ...app.debug, roadInspector: action.enabled };
+      if (!action.enabled) {
+        app.selectedEdgeId = null;
+      }
+      requestRender();
+      return;
+    case "setJunctionInspector":
+      app.debug = { ...app.debug, junctionInspector: action.enabled };
+      if (!action.enabled) {
+        app.selectedJunctionBlockId = null;
+      }
+      requestRender();
+      return;
+    case "setIsolateSelectedJunction":
+      app.debug = { ...app.debug, isolateSelectedJunction: action.enabled };
+      requestRender();
+      return;
+    case "clearJunctionSelection":
+      app.selectedJunctionBlockId = null;
+      app.debug = { ...app.debug, isolateSelectedJunction: false };
+      requestRender();
   }
 }
 
@@ -405,6 +573,34 @@ function ensureGraph(): void {
   graph.render();
   bindGraphEvents();
   requestRender();
+}
+
+function handleInspectorClick(evt: any): boolean {
+  if (app.mode !== "select" || (!app.debug.roadInspector && !app.debug.junctionInspector)) {
+    return false;
+  }
+
+  const point = getCanvasPointFromEvent(evt);
+  const junctionHit = app.debug.junctionInspector ? findJunctionBlockAtPoint(point) : null;
+  if (junctionHit) {
+    app.selectedJunctionBlockId = junctionHit;
+    app.selectedEdgeId = null;
+    requestRender();
+    return true;
+  }
+
+  if (app.debug.roadInspector) {
+    const hit = findRoadAtPoint(app.scene, point);
+    app.selectedEdgeId = hit?.edgeId ?? null;
+    if (hit) {
+      app.selectedJunctionBlockId = null;
+    }
+  } else {
+    app.selectedJunctionBlockId = null;
+  }
+
+  requestRender();
+  return true;
 }
 
 function bindGraphEvents(): void {
@@ -476,6 +672,10 @@ function bindGraphEvents(): void {
   });
 
   graph.on("canvas:click", (evt: any) => {
+    if (app.mode === "select") {
+      handleInspectorClick(evt);
+      return;
+    }
     if (app.mode !== "draw") {
       return;
     }
@@ -490,6 +690,10 @@ function bindGraphEvents(): void {
   });
 
   graph.on("node:click", (evt: any) => {
+    if (app.mode === "select") {
+      handleInspectorClick(evt);
+      return;
+    }
     if (app.mode !== "draw") {
       return;
     }
@@ -509,6 +713,10 @@ function bindGraphEvents(): void {
   });
 
   graph.on("edge:click", (evt: any) => {
+    if (app.mode === "select") {
+      handleInspectorClick(evt);
+      return;
+    }
     if (app.mode !== "draw") {
       return;
     }
@@ -661,7 +869,10 @@ function requestRender(): void {
       draftPoints: app.draftPoints,
       snapPreview: app.snapPreview,
       intersectionPreview: candidateIntersectionPoints(),
-      debugMode: app.debugMode,
+      debug: app.debug,
+      selectedEdgeId: app.selectedEdgeId,
+      selectedJunctionBlockId: app.selectedJunctionBlockId,
+      isolatedJunctionBlockId: app.debug.isolateSelectedJunction ? app.selectedJunctionBlockId : null,
     });
     const allWarnings = [...new Set([...sceneWarnings, ...warnings])];
     updateWarningPanel(allWarnings);
@@ -675,7 +886,14 @@ function requestRender(): void {
           ? `模式：绘制 | 草稿点数 ${app.draftPoints.length}`
           : "模式：绘制 | 点击空白或节点添加控制点，继续点击继续，Enter/结束绘制";
     } else {
-      statusBar.textContent = "模式：选择";
+      statusBar.textContent =
+        app.selectedJunctionBlockId
+          ? `模式：选择 | 已选路口 ${app.selectedJunctionBlockId}${app.debug.isolateSelectedJunction ? " | 单独展示" : ""}`
+          : app.debug.roadInspector || app.debug.junctionInspector
+          ? app.selectedEdgeId
+            ? `模式：选择 | 已选道路 ${app.selectedEdgeId}`
+            : "模式：选择 | 点击道路或路口查看参数"
+          : "模式：选择";
     }
   });
 }
@@ -692,6 +910,10 @@ function switchMode(mode: AppMode): void {
   app.mode = mode;
   if (mode === "select") {
     clearDraft();
+  } else {
+    app.selectedEdgeId = null;
+    app.selectedJunctionBlockId = null;
+    app.debug = { ...app.debug, isolateSelectedJunction: false };
   }
   requestRender();
 }
@@ -757,6 +979,9 @@ function importFromFile(file: File): void {
     const { scene, warnings } = parseRoadPenScene(text);
     sceneWarnings = warnings;
     app.scene = scene;
+    app.selectedEdgeId = null;
+    app.selectedJunctionBlockId = null;
+    app.debug = { ...app.debug, isolateSelectedJunction: false };
     syncCountersFromScene();
     syncGraph();
 
@@ -806,6 +1031,9 @@ function setupListeners(): void {
     const keyboardEvent = event as KeyboardEvent;
     if (keyboardEvent.key === "Escape") {
       clearDraft();
+      app.selectedEdgeId = null;
+      app.selectedJunctionBlockId = null;
+      app.debug = { ...app.debug, isolateSelectedJunction: false };
       requestRender();
       return;
     }

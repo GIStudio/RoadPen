@@ -5,6 +5,7 @@ export interface TurnSpecOptions {
   radiusFactor?: number;
   clampRatio?: number;
   minInnerRadius?: number;
+  skipTurnIndices?: ReadonlySet<number>;
 }
 
 export interface GeometryOptions {
@@ -114,6 +115,7 @@ export function buildSkeletonPathByPoints(points: Point[], maxOffset = 12, optio
     radiusFactor: options.turnOptions?.radiusFactor ?? 2.2,
     clampRatio: options.turnOptions?.clampRatio ?? 0.45,
     minInnerRadius: options.turnOptions?.minInnerRadius ?? 0.4,
+    skipTurnIndices: options.turnOptions?.skipTurnIndices,
   });
 
   const output: Point[] = [];
@@ -230,6 +232,7 @@ export function computeTurnSpecs(
   const radiusFactor = options.radiusFactor ?? 2.2;
   const clampRatio = options.clampRatio ?? 0.45;
   const minInnerRadius = options.minInnerRadius ?? 1;
+  const skipTurnIndices = options.skipTurnIndices;
 
   const angleThreshold = (Math.PI * angleThresholdDeg) / 180;
   const turns = new Map<number, TurnSpec | null>();
@@ -242,6 +245,11 @@ export function computeTurnSpecs(
   const baseRadius = Math.max(clampBase * 2 * radiusFactor, 8, minInnerRadius);
 
   for (let i = 1; i < n - 1; i += 1) {
+    if (skipTurnIndices?.has(i)) {
+      turns.set(i, null);
+      continue;
+    }
+
     const prev = input[i - 1];
     const curr = input[i];
     const next = input[i + 1];
