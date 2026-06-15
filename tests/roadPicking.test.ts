@@ -31,12 +31,13 @@ function sceneWithEdges(edges: RoadEdge[]): RoadPenScene {
   };
 }
 
-function road(id: string, from: string, to: string, a: Point, b: Point): RoadEdge {
+function road(id: string, from: string, to: string, a: Point, b: Point, layer = 0): RoadEdge {
   return {
     id,
     from,
     to,
     geomType: "polyline",
+    layer,
     profileId: "default",
     controlPoints: [a, b],
   };
@@ -72,5 +73,14 @@ describe("roadPicking", () => {
     ]);
 
     expect(["west-road", "east-road", "north-road"]).toContain(findRoadAtPoint(scene, { x: 2, y: -2 })?.edgeId);
+  });
+
+  test("多层道路重叠时应优先拾取较高 layer", () => {
+    const scene = sceneWithEdges([
+      road("lower", "west", "east", { x: -120, y: 0 }, { x: 120, y: 0 }, 0),
+      road("upper", "near-a", "near-b", { x: -80, y: 0 }, { x: 80, y: 0 }, 2),
+    ]);
+
+    expect(findRoadAtPoint(scene, { x: 0, y: 0 })?.edgeId).toBe("upper");
   });
 });

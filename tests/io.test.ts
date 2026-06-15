@@ -49,6 +49,7 @@ describe("import-export", () => {
       from: "n-1",
       to: "n-2",
       geomType: "polyline",
+      layer: 0,
       controlPoints: fixtureScene.edges[0].controlPoints,
     });
   });
@@ -93,5 +94,31 @@ describe("import-export", () => {
 
     expect(scene.edges[0].endMode).toBe("closed");
     expect(legacyScene.edges[0].endMode).toBe("free");
+  });
+
+  test("道路 layer 应导入导出保持，旧数据默认 layer 0", () => {
+    const layeredScene: RoadPenScene = {
+      ...fixtureScene,
+      edges: [
+        {
+          ...fixtureScene.edges[0],
+          layer: 2,
+        },
+      ],
+    };
+    const { scene } = parseRoadPenScene(exportScene(layeredScene));
+    const { scene: legacyScene } = parseRoadPenScene(
+      JSON.stringify({
+        version: "1.0.0",
+        units: "px",
+        scalePxPerM: 20,
+        nodes: fixtureScene.nodes,
+        edges: fixtureScene.edges,
+        profiles: fixtureScene.profiles,
+      }),
+    );
+
+    expect(scene.edges[0].layer).toBe(2);
+    expect(legacyScene.edges[0].layer).toBe(0);
   });
 });

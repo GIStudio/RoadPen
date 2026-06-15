@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Button, Checkbox, Descriptions, Divider, Drawer, Segmented, Space, Switch, Tag, Typography } from "antd";
-import { DEBUG_LAYER_KEYS, DEFAULT_DEBUG_SETTINGS, type DebugLayerKey, type JunctionInspectorDetails, type RoadEndMode, type RoadInspectorDetails, type ToolbarAction, type ToolbarState } from "../types";
+import { Button, Checkbox, Descriptions, Divider, Drawer, InputNumber, Segmented, Space, Switch, Tag, Typography } from "antd";
+import { DEBUG_LAYER_KEYS, DEFAULT_DEBUG_SETTINGS, GEOMETRY_ISSUE_TYPES, type DebugLayerKey, type GeometryIssueReport, type GeometryIssueType, type JunctionInspectorDetails, type RoadEndMode, type RoadInspectorDetails, type ToolbarAction, type ToolbarState } from "../types";
 
 const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
   { label: "选择", value: "select" },
@@ -10,10 +10,21 @@ const TOOLBAR_MODES: Array<{ label: string; value: "select" | "draw" }> = [
 const DEFAULT_STATE: ToolbarState = {
   mode: "select",
   endMode: "free",
+  selectedRoadLayer: 0,
   debug: DEFAULT_DEBUG_SETTINGS,
   debugPanelOpen: false,
   selectedRoad: null,
   selectedJunction: null,
+  geometryIssues: {
+    counts: GEOMETRY_ISSUE_TYPES.reduce(
+      (acc, type) => {
+        acc[type] = 0;
+        return acc;
+      },
+      {} as GeometryIssueReport["counts"],
+    ),
+    markers: [],
+  },
   draftPoints: 0,
   warningCount: 0,
   canFinish: false,
@@ -25,6 +36,19 @@ const DEBUG_LAYER_LABELS: Record<DebugLayerKey, string> = {
   roadSkeleton: "道路骨架/转角",
   junctionBranches: "路口分支",
   laneStops: "lane stop",
+  geometryIssues: "几何问题",
+};
+
+const GEOMETRY_ISSUE_LABELS: Record<GeometryIssueType, string> = {
+  crossLayerOverlap: "跨层遮挡",
+  sameLayerUnsplitCrossing: "同层未拆分",
+  shortEdgeStub: "短 stub",
+  junctionSurfaceGapCandidate: "路口缺口候选",
+  sharpCornerGapCandidate: "锐角候选",
+  outerLaneCoverageGap: "外侧 lane 缺口",
+  extremeTurnFallback: "极限角 fallback",
+  selfOverlapCandidate: "自重叠候选",
+  localZOrderApplied: "局部层级已应用",
 };
 
 function emitAction(action: ToolbarAction): void {
@@ -56,6 +80,15 @@ function RoadDetails({ details, inspectorEnabled }: { details: RoadInspectorDeta
         <Descriptions.Item label="From / To">{details.edge.from} -&gt; {details.edge.to}</Descriptions.Item>
         <Descriptions.Item label="类型">{details.edge.geomType}</Descriptions.Item>
         <Descriptions.Item label="端点">{details.edge.endMode}</Descriptions.Item>
+        <Descriptions.Item label="Layer">
+          <InputNumber
+            size="small"
+            step={1}
+            value={details.edge.layer}
+            onChange={(value) => emitAction({ type: "setSelectedRoadLayer", edgeId: details.edge.id, layer: Number(value ?? 0) })}
+            style={{ width: 80 }}
+          />
+        </Descriptions.Item>
         <Descriptions.Item label="Profile">{details.edge.profileId}</Descriptions.Item>
         <Descriptions.Item label="长度">{fmt(details.edge.length)} px</Descriptions.Item>
       </Descriptions>
@@ -113,12 +146,14 @@ function JunctionDetails({ details, inspectorEnabled }: { details: JunctionInspe
       <Descriptions size="small" bordered column={1}>
         <Descriptions.Item label="Block">{details.id}</Descriptions.Item>
         <Descriptions.Item label="Node">{details.nodeId}</Descriptions.Item>
+        <Descriptions.Item label="Layer">{details.layer}</Descriptions.Item>
         <Descriptions.Item label="类型">{details.type}</Descriptions.Item>
         <Descriptions.Item label="Degree">{details.degree}</Descriptions.Item>
         <Descriptions.Item label="位置">{fmt(details.point.x)}, {fmt(details.point.y)}</Descriptions.Item>
       </Descriptions>
 
       <Descriptions title="路口几何" size="small" bordered column={1}>
+        <Descriptions.Item label="Connections">{details.connectionCount}</Descriptions.Item>
         <Descriptions.Item label="Mouth lines">{details.mouthLineCount}</Descriptions.Item>
         <Descriptions.Item label="Surface patches">{details.surfacePatchCount}</Descriptions.Item>
         <Descriptions.Item label="Lane connectors">{details.laneConnectorCount}</Descriptions.Item>
@@ -131,7 +166,7 @@ function JunctionDetails({ details, inspectorEnabled }: { details: JunctionInspe
         <div className="debug-tags">
           {details.branches.map((branch) => (
             <Tag key={branch.edgeId} color="purple">
-              {branch.edgeId} / {branch.profileId}
+              {branch.edgeId} / L{branch.layer} / {branch.profileId}
             </Tag>
           ))}
         </div>
@@ -174,6 +209,16 @@ export function ToolbarApp(): JSX.Element {
         value={state.endMode}
         onChange={(value) => emitEndMode(value as RoadEndMode)}
       />
+      <Space size={6} align="center">
+        <Typography.Text type="secondary">层级</Typography.Text>
+        <InputNumber
+          size="small"
+          step={1}
+          value={state.selectedRoadLayer}
+          onChange={(value) => emitAction({ type: "setRoadLayer", layer: Number(value ?? 0) })}
+          style={{ width: 72 }}
+        />
+      </Space>
       <Button
         danger
         type="primary"
@@ -187,6 +232,9 @@ export function ToolbarApp(): JSX.Element {
       </Button>
       <Button type="default" onClick={() => emitAction({ type: "exportSvg" })}>
         导出 SVG
+      </Button>
+      <Button type="default" onClick={() => emitAction({ type: "loadValidationScene" })}>
+        验证场景
       </Button>
       <Button
         type={
@@ -235,6 +283,25 @@ export function ToolbarApp(): JSX.Element {
                   {DEBUG_LAYER_LABELS[layer]}
                 </Checkbox>
               ))}
+            </div>
+          </section>
+
+          <Divider />
+
+          <section className="debug-section">
+            <Typography.Text strong>几何问题计数</Typography.Text>
+            <Typography.Text type="secondary" className="debug-row-caption">
+              诊断只标记候选位置，不自动修改旧场景拓扑
+            </Typography.Text>
+            <div className="debug-tags">
+              {GEOMETRY_ISSUE_TYPES.map((type) => {
+                const count = state.geometryIssues.counts[type] ?? 0;
+                return (
+                  <Tag key={type} color={count > 0 ? "orange" : "default"}>
+                    {GEOMETRY_ISSUE_LABELS[type]}: {count}
+                  </Tag>
+                );
+              })}
             </div>
           </section>
 

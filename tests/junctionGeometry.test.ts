@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { buildJunctionGeometry } from "../src/geometry/junctionGeometry";
 import { mergeRoadJunction, multiPolygonToRings } from "../src/geometry/roadMerge";
 import { exportRoadSvg } from "../src/io/svgExport";
-import { buildJunctionOnlyBandBuckets, buildRoadBandPolygons, buildRoadNetworkGeometry } from "../src/render/roadRenderer";
+import { bandBucketKey, buildJunctionOnlyBandBuckets, buildRoadBandPolygons, buildRoadNetworkGeometry } from "../src/render/roadRenderer";
 import type { Point, RoadEdge, RoadPenScene } from "../src/types";
 
 function cross(a: Point, b: Point, c: Point): number {
@@ -138,12 +138,13 @@ function sceneWithEdges(edges: RoadEdge[]): RoadPenScene {
   };
 }
 
-function road(id: string, from: string, to: string, a: Point, b: Point): RoadEdge {
+function road(id: string, from: string, to: string, a: Point, b: Point, layer = 0): RoadEdge {
   return {
     id,
     from,
     to,
     geomType: "polyline",
+    layer,
     profileId: "default",
     controlPoints: [a, b],
   };
@@ -216,6 +217,22 @@ function yScene(): RoadPenScene {
   };
 }
 
+function nearStraightTScene(): RoadPenScene {
+  return {
+    ...sceneWithEdges([
+      road("west-road", "center", "west", { x: 0, y: 0 }, { x: -120, y: 0 }),
+      road("east-skew-road", "center", "east-skew", { x: 0, y: 0 }, { x: 120, y: -4 }),
+      road("south-road", "center", "south", { x: 0, y: 0 }, { x: 0, y: 120 }),
+    ]),
+    nodes: [
+      { id: "center", x: 0, y: 0 },
+      { id: "west", x: -120, y: 0 },
+      { id: "east-skew", x: 120, y: -4 },
+      { id: "south", x: 0, y: 120 },
+    ],
+  };
+}
+
 describe("junctionGeometry", () => {
   test("三条道路共享节点时应识别为 T 路口并生成补片", () => {
     const result = buildJunctionGeometry(tScene());
@@ -223,8 +240,11 @@ describe("junctionGeometry", () => {
     const block = result.junctionBlocks.find((junctionBlock) => junctionBlock.nodeId === "center");
 
     expect(center).toMatchObject({ type: "t", degree: 3 });
-    expect(block).toMatchObject({ id: "junction-center", type: "t", degree: 3 });
+    expect(center).toMatchObject({ layer: 0 });
+    expect(block).toMatchObject({ id: "junction-center", layer: 0, type: "t", degree: 3 });
     expect(block?.surfacePatches.length).toBeGreaterThan(0);
+    expect(block?.connections.filter((connection) => connection.category === "carriageway")).toHaveLength(4);
+    expect(block?.connections.filter((connection) => connection.category !== "carriageway")).toHaveLength(6);
     expect(block?.mouthLines).toHaveLength(3);
     expect(block?.laneConnectorPatches.length).toBeGreaterThan(0);
     expect(result.patches.some((patch) => patch.nodeId === "center" && patch.bandId === "carriageway")).toBe(true);
@@ -260,7 +280,9 @@ describe("junctionGeometry", () => {
     expect(carriagewayPatch?.junctionBlockId).toBe("junction-center");
     expect(hasSelfIntersection(carriagewayPatch?.polygon ?? [])).toBe(false);
     expect(turnPatches).toHaveLength(8);
-    expect(turnPatches.every((patch) => patch.directed && patch.fromEdgeId && patch.toEdgeId && patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
+    expect(turnPatches.every((patch) => patch.connectionId && patch.directed && patch.fromEdgeId && patch.toEdgeId && patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
+    expect(result.patches.filter((patch) => patch.nodeId === "center" && patch.kind === "corner-closure")).toHaveLength(4);
+    expect(result.connections.filter((connection) => connection.nodeId === "center" && connection.category === "carriageway")).toHaveLength(8);
     expect(result.virtualMouthLines.filter((line) => line.nodeId === "center")).toHaveLength(4);
     expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "facility")).toHaveLength(4);
     expect(result.laneConnectorPatches.every((patch) => patch.fromEdgeId !== patch.toEdgeId)).toBe(true);
@@ -281,9 +303,19 @@ describe("junctionGeometry", () => {
     expect(result.laneConnectorPatches.filter((patch) => patch.nodeId === "center" && patch.baseLane === "clearance")).toHaveLength(2);
   });
 
+  test("近 180 度直通角区应生成 large-angle carriageway closure", () => {
+    const result = buildJunctionGeometry(nearStraightTScene());
+    const largeAnglePatches = result.patches.filter((patch) => patch.nodeId === "center" && patch.kind === "large-angle-closure");
+
+    expect(result.junctions.find((junction) => junction.nodeId === "center")).toMatchObject({ type: "t", degree: 3 });
+    expect(largeAnglePatches.length).toBeGreaterThan(0);
+    expect(largeAnglePatches.every((patch) => patch.bandId === "carriageway")).toBe(true);
+    expect(largeAnglePatches.every((patch) => polygonArea(patch.polygon) > 20)).toBe(true);
+  });
+
   test("T 路口补片应让车行道合并为连续 polygon", () => {
     const { bandBuckets, junctionPatches } = buildRoadBandPolygons(tScene());
-    const carriageway = bandBuckets.get("carriageway");
+    const carriageway = bandBuckets.get(bandBucketKey(0, "carriageway"));
     const turnPatches = junctionPatches.filter((patch) => patch.nodeId === "center" && patch.kind === "turn");
 
     expect(junctionPatches.some((patch) => patch.nodeId === "center" && patch.bandId === "carriageway")).toBe(true);
@@ -307,7 +339,7 @@ describe("junctionGeometry", () => {
 
   test("斜向十字路口的对角小三角应由双向车行道右转补齐", () => {
     const { bandBuckets, junctionPatches } = buildRoadBandPolygons(diagonalCrossScene());
-    const carriageway = bandBuckets.get("carriageway");
+    const carriageway = bandBuckets.get(bandBucketKey(0, "carriageway"));
     const turnPatches = junctionPatches.filter((patch) => patch.nodeId === "center" && patch.kind === "turn");
     const forwardDiagonalTurn = turnPatches.find((patch) => patch.fromEdgeId === "north-west-road" && patch.toEdgeId === "north-east-road");
     const reverseDiagonalTurn = turnPatches.find((patch) => patch.fromEdgeId === "north-east-road" && patch.toEdgeId === "north-west-road");
@@ -328,9 +360,28 @@ describe("junctionGeometry", () => {
     expect(network.roadSegments.length).toBeGreaterThan(0);
     expect(block).toBeDefined();
     expect(block?.surfacePatches.every((patch) => patch.junctionBlockId === block.id)).toBe(true);
+    expect(block?.surfacePatches.some((patch) => patch.kind === "corner-closure")).toBe(true);
+    expect(block?.connections.every((connection) => connection.junctionBlockId === block.id)).toBe(true);
     expect(block?.mouthLines.every((line) => line.junctionBlockId === block.id)).toBe(true);
     expect(block?.laneConnectorPatches.every((patch) => patch.junctionBlockId === block.id)).toBe(true);
+    expect(block?.laneConnectorPatches.every((patch) => patch.connectionId)).toBe(true);
     expect(block?.laneStops.every((stop) => stop.junctionBlockId === block.id)).toBe(true);
+  });
+
+  test("同一 node 上不同 layer 的边应分别归属，只有同层 degree >= 3 生成 JunctionBlock", () => {
+    const scene = sceneWithEdges([
+      road("west-road", "center", "west", { x: 0, y: 0 }, { x: -120, y: 0 }, 0),
+      road("east-road", "center", "east", { x: 0, y: 0 }, { x: 120, y: 0 }, 0),
+      road("north-road", "center", "north", { x: 0, y: 0 }, { x: 0, y: -120 }, 0),
+      road("upper-road", "center", "south", { x: 0, y: 0 }, { x: 0, y: 120 }, 1),
+    ]);
+    const result = buildJunctionGeometry(scene);
+
+    expect(result.junctionBlocks).toHaveLength(1);
+    expect(result.junctionBlocks[0]).toMatchObject({ id: "junction-center", nodeId: "center", layer: 0, degree: 3 });
+    expect(result.junctions.find((junction) => junction.nodeId === "center" && junction.layer === 1)).toMatchObject({ degree: 1 });
+    expect(result.patches.every((patch) => patch.layer === 0)).toBe(true);
+    expect(result.laneConnectorPatches.every((patch) => patch.layer === 0)).toBe(true);
   });
 
   test("调试隔离路口时只收集该 JunctionBlock 的路口几何", () => {
@@ -341,8 +392,8 @@ describe("junctionGeometry", () => {
 
     expect(block).toBeDefined();
     expect(isolatedPolygonCount).toBe((block?.surfacePatches.length ?? 0) + (block?.laneConnectorPatches.length ?? 0));
-    expect(isolated.has("carriageway")).toBe(true);
-    expect(isolated.has("sidewalk")).toBe(true);
+    expect(isolated.has(bandBucketKey(0, "carriageway"))).toBe(true);
+    expect(isolated.has(bandBucketKey(0, "sidewalk"))).toBe(true);
     expect(isolatedPolygonCount).toBeLessThan([...data.bandBuckets.values()].reduce((sum, bucket) => sum + bucket.polygons.length, 0));
   });
 
@@ -387,14 +438,30 @@ describe("junctionGeometry", () => {
     expect(svg).toContain('id="junction-patches"');
     expect(svg).toContain('data-kind="virtual-boundary"');
     expect(svg).toContain('data-junction-block-id="junction-center"');
+    expect(svg).toContain('data-road-layer="0"');
     expect(svg).toContain('data-kind="turn"');
+    expect(svg).toContain('data-kind="corner-closure"');
+    expect(svg).toContain('data-connection-id="junction-center-connection-carriageway');
     expect(svg).toContain('data-directed="true"');
     expect(svg).toContain('data-from-edge-id=');
     expect(svg).toContain('data-to-edge-id=');
     expect(svg).toContain('id="virtual-mouth-lines"');
     expect(svg).toContain('id="lane-connectors"');
+    expect(svg).toContain('data-connection-id="junction-center-connection-sidewalk');
     expect(svg).toContain('data-base-lane="sidewalk"');
     expect(svg).toContain('id="junction-labels"');
     expect(svg).toContain('data-junction-type="t"');
+  });
+
+  test("SVG 跨层导出应包含上层 footprint occlusion", () => {
+    const scene = sceneWithEdges([
+      road("lower", "west", "east", { x: -120, y: 0 }, { x: 120, y: 0 }, 0),
+      road("upper", "north", "south", { x: 0, y: -120 }, { x: 0, y: 120 }, 1),
+    ]);
+    const svg = exportRoadSvg(scene, { width: 300, height: 300 });
+
+    expect(svg).toContain('id="layer-occlusion-1"');
+    expect(svg).toContain('data-road-layer="1"');
+    expect(svg).toContain('fill="#0a1024"');
   });
 });

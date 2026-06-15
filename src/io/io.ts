@@ -101,6 +101,10 @@ function asRoadEndMode(v: unknown): RoadEndMode {
   return v === "closed" ? "closed" : "free";
 }
 
+function asRoadLayer(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : 0;
+}
+
 function ensureDefaultProfile(profiles: LaneProfile[]): string {
   const existed = new Set(profiles.map((p) => p.id));
   if (!existed.has("default")) {
@@ -193,6 +197,7 @@ export function normalizeScene(input: Partial<RoadPenScene>): RoadPenScene {
         to,
         geomType: asGeomType(edgeRaw.geomType),
         endMode: asRoadEndMode(edgeRaw.endMode),
+        layer: asRoadLayer(edgeRaw.layer),
         profileId,
         controlPoints,
       });

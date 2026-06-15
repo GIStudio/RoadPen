@@ -10,6 +10,7 @@ import { buildRoadBandPolygons, renderRoads } from "./render/roadRenderer";
 import { ToolbarApp } from "./ui/ToolbarApp";
 import { commitRoadWithTopology, findPathRoadIntersections, findSnapTarget, type DraftAnchor, type SnapTarget } from "./geometry/topology";
 import { findRoadAtPoint } from "./geometry/roadPicking";
+import { buildParkingLotValidationScene } from "./fixtures/parkingLotValidationScene";
 
 const CANVAS_BG = "#0a1024";
 const SNAP_RADIUS = 12;
@@ -33,6 +34,7 @@ interface AppState {
   draftStartNodeId: string | null;
   snapPreview: SnapTarget | null;
   selectedEndMode: RoadEndMode;
+  selectedRoadLayer: number;
   selectedProfileId: string;
   debug: DebugSettings;
   debugPanelOpen: boolean;
@@ -66,6 +68,7 @@ const app: AppState = {
   draftStartNodeId: null,
   snapPreview: null,
   selectedEndMode: "free",
+  selectedRoadLayer: 0,
   selectedProfileId: DEFAULT_PROFILE_ID,
   debug: structuredClone(DEFAULT_DEBUG_SETTINGS),
   debugPanelOpen: false,
@@ -224,6 +227,14 @@ function findNodeById(id: string): SceneNode | undefined {
   return app.scene.nodes.find((node) => node.id === id);
 }
 
+function normalizeRoadLayer(layer: unknown): number {
+  return typeof layer === "number" && Number.isFinite(layer) ? Math.trunc(layer) : 0;
+}
+
+function edgeRoadLayer(edge: RoadPenScene["edges"][number]): number {
+  return normalizeRoadLayer(edge.layer);
+}
+
 function findSnapNode(point: Point, excludeId?: string): { id: string; point: Point } | null {
   let hit: { id: string; point: Point; dist: number } | null = null;
   for (const node of app.scene.nodes) {
@@ -242,6 +253,7 @@ function snapTargetForPoint(point: Point): SnapTarget {
   return findSnapTarget(app.scene, point, {
     nodeRadius: SNAP_RADIUS,
     edgeRadius: EDGE_SNAP_RADIUS,
+    activeLayer: app.selectedRoadLayer,
   });
 }
 
@@ -303,7 +315,7 @@ function candidatePreviewPath(): Point[] | null {
 
 function candidateIntersectionPoints(): Point[] {
   const path = candidatePreviewPath();
-  return path ? findPathRoadIntersections(app.scene, path, true).map((hit) => hit.point) : [];
+  return path ? findPathRoadIntersections(app.scene, path, true, { activeLayer: app.selectedRoadLayer }).map((hit) => hit.point) : [];
 }
 
 function snapStatusText(): string | null {
@@ -327,7 +339,7 @@ function polylineLength(points: Point[]): number {
   return total;
 }
 
-function selectedRoadDetails(): RoadInspectorDetails | null {
+function selectedRoadDetails(roadData = buildRoadBandPolygons(app.scene)): RoadInspectorDetails | null {
   if (!app.selectedEdgeId) {
     return null;
   }
@@ -338,10 +350,10 @@ function selectedRoadDetails(): RoadInspectorDetails | null {
   }
 
   const profile = app.scene.profiles.find((item) => item.id === edge.profileId) ?? null;
-  const roadData = buildRoadBandPolygons(app.scene);
+  const layer = edgeRoadLayer(edge);
   const chain = roadData.edgeCenterlines.find((item) => item.edgeIds.includes(edge.id));
   const endpoints = [edge.from, edge.to].map((nodeId) => {
-    const junction = roadData.junctions.find((item) => item.nodeId === nodeId);
+    const junction = roadData.junctions.find((item) => item.nodeId === nodeId && item.layer === layer);
     return {
       nodeId,
       junctionType: junction?.type ?? null,
@@ -356,6 +368,7 @@ function selectedRoadDetails(): RoadInspectorDetails | null {
       to: edge.to,
       geomType: edge.geomType,
       endMode: edge.endMode ?? "free",
+      layer,
       profileId: edge.profileId,
       controlPointCount: edge.controlPoints.length,
       controlPoints: edge.controlPoints.map((point) => ({ ...point })),
@@ -398,12 +411,11 @@ function pointInPolygon(point: Point, polygon: Point[]): boolean {
   return inside;
 }
 
-function selectedJunctionDetails(): JunctionInspectorDetails | null {
+function selectedJunctionDetails(roadData = buildRoadBandPolygons(app.scene)): JunctionInspectorDetails | null {
   if (!app.selectedJunctionBlockId) {
     return null;
   }
 
-  const roadData = buildRoadBandPolygons(app.scene);
   const block = roadData.junctionBlocks.find((item) => item.id === app.selectedJunctionBlockId);
   if (!block) {
     return null;
@@ -412,10 +424,12 @@ function selectedJunctionDetails(): JunctionInspectorDetails | null {
   return {
     id: block.id,
     nodeId: block.nodeId,
+    layer: block.layer,
     type: block.type,
     degree: block.degree,
     point: { ...block.point },
     branchCount: block.branches.length,
+    connectionCount: block.connections.length,
     mouthLineCount: block.mouthLines.length,
     surfacePatchCount: block.surfacePatches.length,
     laneConnectorCount: block.laneConnectorPatches.length,
@@ -424,6 +438,7 @@ function selectedJunctionDetails(): JunctionInspectorDetails | null {
     branches: block.branches.map((branch) => ({
       edgeId: branch.edgeId,
       profileId: branch.profileId,
+      layer: branch.layer,
       direction: { ...branch.direction },
     })),
   };
@@ -448,13 +463,16 @@ function findJunctionBlockAtPoint(point: Point): string | null {
 }
 
 function emitToolbarState(): void {
+  const roadData = buildRoadBandPolygons(app.scene);
   const nextState: ToolbarState = {
     mode: app.mode,
     endMode: app.selectedEndMode,
+    selectedRoadLayer: app.selectedRoadLayer,
     debug: structuredClone(app.debug),
     debugPanelOpen: app.debugPanelOpen,
-    selectedRoad: selectedRoadDetails(),
-    selectedJunction: selectedJunctionDetails(),
+    selectedRoad: selectedRoadDetails(roadData),
+    selectedJunction: selectedJunctionDetails(roadData),
+    geometryIssues: roadData.geometryIssues,
     draftPoints: app.draftPoints.length,
     warningCount: sceneWarnings.length,
     canFinish: app.mode === "draw" && app.draftPoints.length >= 2,
@@ -486,10 +504,27 @@ function handleToolbarAction(action: ToolbarAction): void {
       importInput.value = "";
       importInput.click();
       return;
+    case "loadValidationScene":
+      loadValidationScene();
+      return;
     case "setEndMode":
       app.selectedEndMode = action.endMode;
       requestRender();
       return;
+    case "setRoadLayer":
+      app.selectedRoadLayer = normalizeRoadLayer(action.layer);
+      app.snapPreview = null;
+      requestRender();
+      return;
+    case "setSelectedRoadLayer": {
+      const edge = app.scene.edges.find((item) => item.id === action.edgeId);
+      if (edge) {
+        edge.layer = normalizeRoadLayer(action.layer);
+        app.selectedRoadLayer = edge.layer;
+      }
+      requestRender();
+      return;
+    }
     case "setDebugPanelOpen":
       app.debugPanelOpen = action.open;
       requestRender();
@@ -531,6 +566,20 @@ function handleToolbarAction(action: ToolbarAction): void {
       app.debug = { ...app.debug, isolateSelectedJunction: false };
       requestRender();
   }
+}
+
+function loadValidationScene(): void {
+  app.scene = buildParkingLotValidationScene();
+  app.mode = "select";
+  app.selectedRoadLayer = 0;
+  app.selectedEdgeId = null;
+  app.selectedJunctionBlockId = null;
+  app.debug = { ...app.debug, isolateSelectedJunction: false };
+  sceneWarnings = [];
+  clearDraft();
+  syncCountersFromScene();
+  syncGraph();
+  requestRender();
 }
 
 function ensureGraph(): void {
@@ -704,10 +753,12 @@ function bindGraphEvents(): void {
     }
 
     const point = { x: model.x, y: model.y };
-    pushDraftAnchor(nodeAnchor(model.id, point));
-    if (!app.draftStartNodeId) {
-      app.draftStartNodeId = model.id;
+    const snap = snapTargetForPoint(point);
+    pushDraftAnchor(anchorFromSnapTarget(snap));
+    if (!app.draftStartNodeId && snap.type === "node") {
+      app.draftStartNodeId = snap.nodeId;
     }
+    app.snapPreview = snap;
 
     requestRender();
   });
@@ -745,12 +796,7 @@ function bindGraphEvents(): void {
     if (!model) {
       return;
     }
-    app.snapPreview = {
-      type: "node",
-      point: { x: model.x, y: model.y },
-      distance: 0,
-      nodeId: model.id,
-    };
+    app.snapPreview = snapTargetForPoint({ x: model.x, y: model.y });
     requestRender();
   });
 
@@ -781,7 +827,7 @@ function addEdgeFromDraft(chain = false): void {
     app.draftAnchors.length === app.draftPoints.length
       ? app.draftAnchors
       : app.draftPoints.map((point) => freeAnchor(point));
-  const result = commitRoadWithTopology(app.scene, anchors, app.selectedProfileId, nextNodeId, nextEdgeId, app.selectedEndMode);
+  const result = commitRoadWithTopology(app.scene, anchors, app.selectedProfileId, nextNodeId, nextEdgeId, app.selectedEndMode, app.selectedRoadLayer);
   if (!result || result.createdEdgeIds.length === 0) {
     if (result?.warnings.length) {
       sceneWarnings = result.warnings;
@@ -866,6 +912,7 @@ function requestRender(): void {
     const warnings = renderRoads(ctx, app.scene, {
       width,
       height,
+      backgroundColor: CANVAS_BG,
       draftPoints: app.draftPoints,
       snapPreview: app.snapPreview,
       intersectionPreview: candidateIntersectionPoints(),
@@ -879,12 +926,13 @@ function requestRender(): void {
 
     if (app.mode === "draw") {
       const snapText = snapStatusText();
+      const layerText = `层级 ${app.selectedRoadLayer}`;
       statusBar.textContent =
         snapText
-          ? `模式：绘制 | ${snapText}`
+          ? `模式：绘制 | ${layerText} | ${snapText}`
           : app.draftPoints.length > 0
-          ? `模式：绘制 | 草稿点数 ${app.draftPoints.length}`
-          : "模式：绘制 | 点击空白或节点添加控制点，继续点击继续，Enter/结束绘制";
+          ? `模式：绘制 | ${layerText} | 草稿点数 ${app.draftPoints.length}`
+          : `模式：绘制 | ${layerText} | 点击空白或节点添加控制点，继续点击继续，Enter/结束绘制`;
     } else {
       statusBar.textContent =
         app.selectedJunctionBlockId

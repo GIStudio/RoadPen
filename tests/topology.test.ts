@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { buildJunctionGeometry } from "../src/geometry/junctionGeometry";
 import { commitRoadWithTopology, findSnapTarget, type DraftAnchor } from "../src/geometry/topology";
 import { exportScene, parseRoadPenScene } from "../src/io/io";
-import { buildRoadBandPolygons } from "../src/render/roadRenderer";
+import { bandBucketKey, buildRoadBandPolygons } from "../src/render/roadRenderer";
 import type { Point, RoadEdge, RoadPenScene } from "../src/types";
 
 function sceneWithEdges(edges: RoadEdge[], nodes: RoadPenScene["nodes"]): RoadPenScene {
@@ -25,13 +25,14 @@ function sceneWithEdges(edges: RoadEdge[], nodes: RoadPenScene["nodes"]): RoadPe
   };
 }
 
-function road(id: string, from: string, to: string, points: Point[], endMode: RoadEdge["endMode"] = "free"): RoadEdge {
+function road(id: string, from: string, to: string, points: Point[], endMode: RoadEdge["endMode"] = "free", layer = 0): RoadEdge {
   return {
     id,
     from,
     to,
     geomType: points.length === 2 ? "polyline" : "spline",
     endMode,
+    layer,
     profileId: "default",
     controlPoints: points,
   };
@@ -126,6 +127,44 @@ describe("topology", () => {
     expect(junctionPatches.some((patch) => patch.nodeId === junction?.nodeId && patch.bandId === "carriageway")).toBe(true);
   });
 
+  test("拆分道路时不应复用附近但不在投影点上的节点", () => {
+    const scene = sceneWithEdges(
+      [road("main", "west", "east", [{ x: -100, y: 0 }, { x: 100, y: 0 }])],
+      [
+        { id: "west", x: -100, y: 0 },
+        { id: "east", x: 100, y: 0 },
+        { id: "near-off-line", x: 0, y: 8 },
+      ],
+    );
+    const ids = idFactories(scene);
+    const anchors = [freeAnchor({ x: 0, y: -80 }), anchorFromPoint(scene, { x: 0, y: 6 })];
+
+    const result = commitRoadWithTopology(scene, anchors, "default", ids.node, ids.edge);
+    const splitNode = scene.nodes.find((node) => Math.hypot(node.x, node.y) < 1e-6);
+
+    expect(result?.createdNodeIds).toContain(splitNode?.id);
+    expect(splitNode).toMatchObject({ x: 0, y: 0 });
+    expect(scene.nodes.find((node) => node.id === "near-off-line")).toMatchObject({ x: 0, y: 8 });
+    expect(scene.edges.some((edge) => edge.from === "near-off-line" || edge.to === "near-off-line")).toBe(false);
+  });
+
+  test("路径中间控制点贴到旧路时不应拆分旧道路", () => {
+    const scene = horizontalScene();
+    const ids = idFactories(scene);
+    const anchors = [
+      freeAnchor({ x: -80, y: -80 }),
+      anchorFromPoint(scene, { x: 0, y: 6 }),
+      freeAnchor({ x: 80, y: 80 }),
+    ];
+
+    const result = commitRoadWithTopology(scene, anchors, "default", ids.node, ids.edge);
+
+    expect(result?.createdEdgeIds).toHaveLength(1);
+    expect(result?.splitEdgeIds).toHaveLength(0);
+    expect(scene.edges).toHaveLength(2);
+    expect(scene.edges.find((edge) => edge.id === "main")?.controlPoints).toEqual([{ x: -100, y: 0 }, { x: 100, y: 0 }]);
+  });
+
   test("T 路口穿越道路的 source/render 骨架应保留路口节点", () => {
     const scene = angledPassThroughTScene();
     const { edgeCenterlines } = buildRoadBandPolygons(scene);
@@ -155,6 +194,50 @@ describe("topology", () => {
     expect(junctionPatches.some((patch) => patch.nodeId === junction?.nodeId && patch.bandId === "carriageway")).toBe(true);
   });
 
+  test("自动 split 后应移除贴近交点的控制点，避免路口旁产生极短急转弯", () => {
+    const scene = horizontalScene();
+    const ids = idFactories(scene);
+    const anchors = [
+      freeAnchor({ x: -80, y: -80 }),
+      freeAnchor({ x: 0, y: -4 }),
+      freeAnchor({ x: 80, y: 80 }),
+    ];
+
+    const result = commitRoadWithTopology(scene, anchors, "default", ids.node, ids.edge);
+    const renderData = buildRoadBandPolygons(scene);
+
+    expect(result?.createdEdgeIds).toHaveLength(2);
+    expect(result?.splitEdgeIds.length).toBeGreaterThan(0);
+    for (const edgeId of result?.createdEdgeIds ?? []) {
+      const edge = scene.edges.find((item) => item.id === edgeId);
+      expect(edge?.controlPoints).toHaveLength(2);
+    }
+    expect(renderData.warnings.some((warning) => warning.includes("转折过急"))).toBe(false);
+  });
+
+  test("跨 layer 交叉时不应拆分道路或生成 JunctionBlock", () => {
+    const scene = horizontalScene();
+    const ids = idFactories(scene);
+
+    const result = commitRoadWithTopology(scene, [freeAnchor({ x: 0, y: -80 }), freeAnchor({ x: 0, y: 80 })], "default", ids.node, ids.edge, "free", 1);
+    const junctionGeometry = buildJunctionGeometry(scene);
+    const renderData = buildRoadBandPolygons(scene);
+
+    expect(result?.createdEdgeIds).toHaveLength(1);
+    expect(result?.splitEdgeIds).toHaveLength(0);
+    expect(scene.edges).toHaveLength(2);
+    expect(junctionGeometry.junctionBlocks).toHaveLength(0);
+    expect(renderData.bandBuckets.has(bandBucketKey(0, "carriageway"))).toBe(true);
+    expect(renderData.bandBuckets.has(bandBucketKey(1, "carriageway"))).toBe(true);
+  });
+
+  test("当前 layer 为 1 时不应吸附到 layer 0 道路中段", () => {
+    const scene = horizontalScene();
+    const snap = findSnapTarget(scene, { x: 12, y: 7 }, { nodeRadius: 12, edgeRadius: 16, activeLayer: 1 });
+
+    expect(snap.type).toBe("free");
+  });
+
   test("自动拓扑后的 scene 导出再导入应保持共享节点结构", () => {
     const scene = horizontalScene();
     const ids = idFactories(scene);
@@ -177,10 +260,10 @@ describe("topology", () => {
     );
     const { bandBuckets } = buildRoadBandPolygons(scene);
 
-    expect(bandBuckets.get("carriageway")?.polygons.length).toBeGreaterThan(1);
-    expect(bandBuckets.get("facility")?.polygons.length).toBeGreaterThan(2);
-    expect(bandBuckets.get("sidewalk")?.polygons.length).toBeGreaterThan(2);
-    expect(bandBuckets.get("clearance")?.polygons.length).toBeGreaterThan(2);
+    expect(bandBuckets.get(bandBucketKey(0, "carriageway"))?.polygons.length).toBeGreaterThan(1);
+    expect(bandBuckets.get(bandBucketKey(0, "facility"))?.polygons.length).toBeGreaterThan(2);
+    expect(bandBuckets.get(bandBucketKey(0, "sidewalk"))?.polygons.length).toBeGreaterThan(2);
+    expect(bandBuckets.get(bandBucketKey(0, "clearance"))?.polygons.length).toBeGreaterThan(2);
   });
 
   test("默认自由端道路不应生成圆头封闭补片", () => {

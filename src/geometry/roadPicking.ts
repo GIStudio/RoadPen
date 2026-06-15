@@ -3,6 +3,7 @@ import { buildLaneBandsForProfile, distance } from "./roadGeometry";
 
 export interface RoadPickHit {
   edgeId: string;
+  layer: number;
   distance: number;
   threshold: number;
   point: Point;
@@ -32,6 +33,10 @@ function profileMaxOffset(profileId: string, profileMap: ProfileMap): number {
   return Math.max(0, ...bands.map((band) => Math.max(Math.abs(band.qInner), Math.abs(band.qOuter))));
 }
 
+function roadLayer(edge: RoadEdge): number {
+  return typeof edge.layer === "number" && Number.isFinite(edge.layer) ? Math.trunc(edge.layer) : 0;
+}
+
 function closestPointOnSegment(point: Point, a: Point, b: Point): { point: Point; distance: number } {
   const ab = { x: b.x - a.x, y: b.y - a.y };
   const lenSq = ab.x * ab.x + ab.y * ab.y;
@@ -58,6 +63,7 @@ function bestHitOnEdge(edge: RoadEdge, point: Point, threshold: number): RoadPic
     if (!best || candidate.distance < best.distance) {
       best = {
         edgeId: edge.id,
+        layer: roadLayer(edge),
         distance: candidate.distance,
         threshold,
         point: candidate.point,
@@ -79,7 +85,7 @@ export function findRoadAtPoint(scene: RoadPenScene, point: Point, tolerancePx =
     if (!hit) {
       continue;
     }
-    if (!best || hit.distance < best.distance) {
+    if (!best || hit.layer > best.layer || (hit.layer === best.layer && hit.distance < best.distance)) {
       best = hit;
     }
   }

@@ -32,6 +32,7 @@ export interface RoadEdge {
   to: string;
   geomType: GeometryType;
   endMode?: RoadEndMode;
+  layer?: number;
   profileId: string;
   controlPoints: Point[];
 }
@@ -73,6 +74,7 @@ export const DEBUG_LAYER_KEYS = [
   "roadSkeleton",
   "junctionBranches",
   "laneStops",
+  "geometryIssues",
 ] as const;
 
 export type DebugLayerKey = typeof DEBUG_LAYER_KEYS[number];
@@ -93,6 +95,7 @@ export const DEFAULT_DEBUG_SETTINGS: DebugSettings = {
     roadSkeleton: true,
     junctionBranches: true,
     laneStops: true,
+    geometryIssues: true,
   },
   roadInspector: false,
   junctionInspector: false,
@@ -106,6 +109,7 @@ export interface RoadInspectorDetails {
     to: string;
     geomType: GeometryType;
     endMode: RoadEndMode;
+    layer: number;
     profileId: string;
     controlPointCount: number;
     controlPoints: Point[];
@@ -130,10 +134,12 @@ export interface RoadInspectorDetails {
 export interface JunctionInspectorDetails {
   id: string;
   nodeId: string;
+  layer: number;
   type: JunctionType;
   degree: number;
   point: Point;
   branchCount: number;
+  connectionCount: number;
   mouthLineCount: number;
   surfacePatchCount: number;
   laneConnectorCount: number;
@@ -142,8 +148,37 @@ export interface JunctionInspectorDetails {
   branches: Array<{
     edgeId: string;
     profileId: string;
+    layer: number;
     direction: Point;
   }>;
+}
+
+export const GEOMETRY_ISSUE_TYPES = [
+  "crossLayerOverlap",
+  "sameLayerUnsplitCrossing",
+  "shortEdgeStub",
+  "junctionSurfaceGapCandidate",
+  "sharpCornerGapCandidate",
+  "outerLaneCoverageGap",
+  "extremeTurnFallback",
+  "selfOverlapCandidate",
+  "localZOrderApplied",
+] as const;
+
+export type GeometryIssueType = typeof GEOMETRY_ISSUE_TYPES[number];
+
+export interface GeometryIssueMarker {
+  type: GeometryIssueType;
+  layer: number;
+  point: Point;
+  message: string;
+  edgeIds?: string[];
+  junctionBlockId?: string;
+}
+
+export interface GeometryIssueReport {
+  counts: Record<GeometryIssueType, number>;
+  markers: GeometryIssueMarker[];
 }
 
 export type ToolbarAction =
@@ -152,7 +187,10 @@ export type ToolbarAction =
   | { type: "export" }
   | { type: "exportSvg" }
   | { type: "import" }
+  | { type: "loadValidationScene" }
   | { type: "setEndMode"; endMode: RoadEndMode }
+  | { type: "setRoadLayer"; layer: number }
+  | { type: "setSelectedRoadLayer"; edgeId: string; layer: number }
   | { type: "setDebugPanelOpen"; open: boolean }
   | { type: "setDebugEnabled"; enabled: boolean }
   | { type: "setDebugLayer"; layer: DebugLayerKey; enabled: boolean }
@@ -164,10 +202,12 @@ export type ToolbarAction =
 export interface ToolbarState {
   mode: "select" | "draw";
   endMode: RoadEndMode;
+  selectedRoadLayer: number;
   debug: DebugSettings;
   debugPanelOpen: boolean;
   selectedRoad: RoadInspectorDetails | null;
   selectedJunction: JunctionInspectorDetails | null;
+  geometryIssues: GeometryIssueReport;
   draftPoints: number;
   warningCount: number;
   canFinish: boolean;

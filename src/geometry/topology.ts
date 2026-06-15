@@ -39,6 +39,7 @@ export interface SnapOptions {
   nodeRadius?: number;
   edgeRadius?: number;
   excludeEdgeIds?: Set<string>;
+  activeLayer?: number;
 }
 
 export interface SplitTarget {
@@ -67,6 +68,16 @@ export interface IntersectionHit {
 
 const EPS = 1e-7;
 const NODE_REUSE_RADIUS = 12;
+const SPLIT_NODE_REUSE_EPS = 1e-4;
+const SPLIT_CONTROL_POINT_SPACING = 8;
+
+function normalizeRoadLayer(layer: unknown): number {
+  return typeof layer === "number" && Number.isFinite(layer) ? Math.trunc(layer) : 0;
+}
+
+function roadLayer(edge: RoadEdge): number {
+  return normalizeRoadLayer(edge.layer);
+}
 
 function clonePoint(point: Point): Point {
   return { x: point.x, y: point.y };
@@ -110,9 +121,26 @@ function pushDistinct(points: Point[], point: Point): void {
   }
 }
 
-function findNodeNear(scene: RoadPenScene, point: Point, radius: number): SceneNode | null {
+function nodeCanSnapOnLayer(scene: RoadPenScene, nodeId: string, activeLayer: number): boolean {
+  let incidentEdges = 0;
+  for (const edge of scene.edges) {
+    if (edge.from !== nodeId && edge.to !== nodeId) {
+      continue;
+    }
+    incidentEdges += 1;
+    if (roadLayer(edge) === activeLayer) {
+      return true;
+    }
+  }
+  return incidentEdges > 0;
+}
+
+function findNodeNear(scene: RoadPenScene, point: Point, radius: number, activeLayer: number): SceneNode | null {
   let best: { node: SceneNode; dist: number } | null = null;
   for (const node of scene.nodes) {
+    if (!nodeCanSnapOnLayer(scene, node.id, activeLayer)) {
+      continue;
+    }
     const dist = distance(node, point);
     if (dist <= radius && (!best || dist < best.dist)) {
       best = { node, dist };
@@ -140,7 +168,8 @@ function projectPointToSegment(point: Point, a: Point, b: Point): { point: Point
 export function findSnapTarget(scene: RoadPenScene, point: Point, options: SnapOptions = {}): SnapTarget {
   const nodeRadius = options.nodeRadius ?? 12;
   const edgeRadius = options.edgeRadius ?? 16;
-  const node = findNodeNear(scene, point, nodeRadius);
+  const activeLayer = normalizeRoadLayer(options.activeLayer);
+  const node = findNodeNear(scene, point, nodeRadius, activeLayer);
   if (node) {
     return {
       type: "node",
@@ -153,6 +182,9 @@ export function findSnapTarget(scene: RoadPenScene, point: Point, options: SnapO
   let bestEdge: Extract<SnapTarget, { type: "edge" }> | null = null;
   for (const edge of scene.edges) {
     if (options.excludeEdgeIds?.has(edge.id)) {
+      continue;
+    }
+    if (roadLayer(edge) !== activeLayer) {
       continue;
     }
 
@@ -208,9 +240,15 @@ function isPathEndpoint(path: Point[], point: Point): boolean {
   return path.length > 0 && (distance(path[0], point) <= EPS || distance(path[path.length - 1], point) <= EPS);
 }
 
-export function findPathRoadIntersections(scene: RoadPenScene, path: Point[], ignorePathEndpoints = true): IntersectionHit[] {
+export function findPathRoadIntersections(
+  scene: RoadPenScene,
+  path: Point[],
+  ignorePathEndpoints = true,
+  options: { activeLayer?: number } = {},
+): IntersectionHit[] {
   const hits: IntersectionHit[] = [];
   const seen = new Set<string>();
+  const activeLayer = normalizeRoadLayer(options.activeLayer);
   if (path.length < 2) {
     return hits;
   }
@@ -223,6 +261,9 @@ export function findPathRoadIntersections(scene: RoadPenScene, path: Point[], ig
     }
 
     for (const edge of scene.edges) {
+      if (roadLayer(edge) !== activeLayer) {
+        continue;
+      }
       for (let edgeIndex = 0; edgeIndex < edge.controlPoints.length - 1; edgeIndex += 1) {
         const c = edge.controlPoints[edgeIndex];
         const d = edge.controlPoints[edgeIndex + 1];
@@ -234,7 +275,8 @@ export function findPathRoadIntersections(scene: RoadPenScene, path: Point[], ig
         if (!hit) {
           continue;
         }
-        if (ignorePathEndpoints && isPathEndpoint(path, hit.point)) {
+        const pathSegmentEndpointHit = hit.t <= EPS || hit.t >= 1 - EPS;
+        if (ignorePathEndpoints && (isPathEndpoint(path, hit.point) || pathSegmentEndpointHit)) {
           continue;
         }
 
@@ -259,8 +301,15 @@ export function findPathRoadIntersections(scene: RoadPenScene, path: Point[], ig
   return hits;
 }
 
-function getOrCreateNode(scene: RoadPenScene, point: Point, nodeIdFactory: () => string, createdNodeIds: string[], reuseRadius = NODE_REUSE_RADIUS): string {
-  const existing = findNodeNear(scene, point, reuseRadius);
+function getOrCreateNode(
+  scene: RoadPenScene,
+  point: Point,
+  nodeIdFactory: () => string,
+  createdNodeIds: string[],
+  activeLayer: number,
+  reuseRadius = NODE_REUSE_RADIUS,
+): string {
+  const existing = findNodeNear(scene, point, reuseRadius, activeLayer);
   if (existing) {
     return existing.id;
   }
@@ -269,6 +318,16 @@ function getOrCreateNode(scene: RoadPenScene, point: Point, nodeIdFactory: () =>
   scene.nodes.push({ id, x: point.x, y: point.y });
   createdNodeIds.push(id);
   return id;
+}
+
+function getOrCreateSplitNode(
+  scene: RoadPenScene,
+  point: Point,
+  nodeIdFactory: () => string,
+  createdNodeIds: string[],
+  activeLayer: number,
+): string {
+  return getOrCreateNode(scene, point, nodeIdFactory, createdNodeIds, activeLayer, SPLIT_NODE_REUSE_EPS);
 }
 
 function pointForNode(scene: RoadPenScene, nodeId: string, fallback: Point): Point {
@@ -300,6 +359,25 @@ function normalizedSplitTargets(edge: RoadEdge, targets: SplitTarget[]): PathSto
   return out;
 }
 
+function simplifySplitPiecePoints(points: Point[]): Point[] {
+  if (points.length <= 2) {
+    return points.map((point) => clonePoint(point));
+  }
+
+  const simplified: Point[] = [clonePoint(points[0])];
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const point = points[i];
+    const previous = simplified[simplified.length - 1];
+    const next = points[i + 1];
+    if (distance(previous, point) <= SPLIT_CONTROL_POINT_SPACING || distance(point, next) <= SPLIT_CONTROL_POINT_SPACING) {
+      continue;
+    }
+    pushDistinct(simplified, point);
+  }
+  pushDistinct(simplified, points[points.length - 1]);
+  return simplified;
+}
+
 function splitPathIntoPieces(path: Point[], startNodeId: string, endNodeId: string, stops: PathStop[]): Array<{ from: string; to: string; points: Point[] }> {
   const sortedStops = [...stops].sort((a, b) => a.segmentIndex + a.t - (b.segmentIndex + b.t));
   const pieces: Array<{ from: string; to: string; points: Point[] }> = [];
@@ -318,8 +396,9 @@ function splitPathIntoPieces(path: Point[], startNodeId: string, endNodeId: stri
       pushDistinct(points, path[i]);
     }
     pushDistinct(points, stop.point);
-    if (points.length >= 2) {
-      pieces.push({ from, to: stop.nodeId, points });
+    const simplified = simplifySplitPiecePoints(points);
+    if (simplified.length >= 2) {
+      pieces.push({ from, to: stop.nodeId, points: simplified });
     }
 
     from = stop.nodeId;
@@ -332,8 +411,9 @@ function splitPathIntoPieces(path: Point[], startNodeId: string, endNodeId: stri
     for (let i = nextVertexIndex; i < path.length; i += 1) {
       pushDistinct(points, path[i]);
     }
-    if (points.length >= 2) {
-      pieces.push({ from, to: endNodeId, points });
+    const simplified = simplifySplitPiecePoints(points);
+    if (simplified.length >= 2) {
+      pieces.push({ from, to: endNodeId, points: simplified });
     }
   }
 
@@ -354,6 +434,7 @@ export function splitEdgesAtTargets(scene: RoadPenScene, targets: SplitTarget[],
     }
 
     const edge = scene.edges[edgeIndex];
+    edge.layer = roadLayer(edge);
     const stops = normalizedSplitTargets(edge, edgeTargets);
     if (stops.length === 0) {
       continue;
@@ -376,6 +457,7 @@ export function splitEdgesAtTargets(scene: RoadPenScene, targets: SplitTarget[],
       to: piece.to,
       geomType: geometryTypeForControlPoints(piece.points),
       endMode: edge.endMode,
+      layer: roadLayer(edge),
       profileId: edge.profileId,
       controlPoints: piece.points,
     }));
@@ -392,13 +474,14 @@ function endpointNodeForAnchor(
   nodeIdFactory: () => string,
   createdNodeIds: string[],
   splitTargets: SplitTarget[],
+  activeLayer: number,
 ): string {
   if (anchor.snap.type === "node") {
     return anchor.snap.nodeId;
   }
 
   if (anchor.snap.type === "edge") {
-    const nodeId = getOrCreateNode(scene, anchor.snap.point, nodeIdFactory, createdNodeIds);
+    const nodeId = getOrCreateSplitNode(scene, anchor.snap.point, nodeIdFactory, createdNodeIds, activeLayer);
     const point = pointForNode(scene, nodeId, anchor.snap.point);
     splitTargets.push({
       edgeId: anchor.snap.edgeId,
@@ -410,7 +493,7 @@ function endpointNodeForAnchor(
     return nodeId;
   }
 
-  return getOrCreateNode(scene, anchor.point, nodeIdFactory, createdNodeIds);
+  return getOrCreateNode(scene, anchor.point, nodeIdFactory, createdNodeIds, activeLayer);
 }
 
 export function commitRoadWithTopology(
@@ -420,6 +503,7 @@ export function commitRoadWithTopology(
   nodeIdFactory: () => string,
   edgeIdFactory: () => string,
   endMode: RoadEndMode = "free",
+  activeLayer = 0,
 ): TopologyCommitResult | null {
   if (anchors.length < 2) {
     return null;
@@ -430,8 +514,9 @@ export function commitRoadWithTopology(
   const createdEdgeIds: string[] = [];
   const splitTargets: SplitTarget[] = [];
 
-  const fromNodeId = endpointNodeForAnchor(scene, anchors[0], nodeIdFactory, createdNodeIds, splitTargets);
-  const toNodeId = endpointNodeForAnchor(scene, anchors[anchors.length - 1], nodeIdFactory, createdNodeIds, splitTargets);
+  const roadLayerValue = normalizeRoadLayer(activeLayer);
+  const fromNodeId = endpointNodeForAnchor(scene, anchors[0], nodeIdFactory, createdNodeIds, splitTargets, roadLayerValue);
+  const toNodeId = endpointNodeForAnchor(scene, anchors[anchors.length - 1], nodeIdFactory, createdNodeIds, splitTargets, roadLayerValue);
   if (fromNodeId === toNodeId) {
     warnings.push("起点和终点吸附到了同一个节点，已跳过道路创建。");
     return {
@@ -455,9 +540,9 @@ export function commitRoadWithTopology(
   path[path.length - 1] = { x: toNode.x, y: toNode.y };
 
   const newPathStops: PathStop[] = [];
-  const intersections = findPathRoadIntersections(scene, path, true);
+  const intersections = findPathRoadIntersections(scene, path, true, { activeLayer: roadLayerValue });
   for (const hit of intersections) {
-    const nodeId = getOrCreateNode(scene, hit.point, nodeIdFactory, createdNodeIds);
+    const nodeId = getOrCreateSplitNode(scene, hit.point, nodeIdFactory, createdNodeIds, roadLayerValue);
     const point = pointForNode(scene, nodeId, hit.point);
     if (nodeId === fromNodeId || nodeId === toNodeId) {
       continue;
@@ -490,6 +575,7 @@ export function commitRoadWithTopology(
       to: piece.to,
       geomType: geometryTypeForControlPoints(piece.points),
       endMode,
+      layer: roadLayerValue,
       profileId,
       controlPoints: piece.points,
     };
