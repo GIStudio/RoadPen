@@ -2489,8 +2489,8 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
         }
       }
 
-	      if (band.id === "carriageway") {
-	        const stoppedSpans = visibleLaneSpansAroundStops(centerline, mouthStopsForCarriageway(), defaultLaneStopDistance, nodeAnchors);
+      if (band.id === "carriageway") {
+        const stoppedSpans = visibleLaneSpansAroundStops(centerline, mouthStopsForCarriageway(), defaultLaneStopDistance, nodeAnchors);
         for (const stop of stoppedSpans.stops) {
           const key = `${chain.id}:${chainLayer}:${band.id}:${stop.nodeId}:${stop.point.x.toFixed(2)}:${stop.point.y.toFixed(2)}`;
           if (!laneStopDebugKeys.has(key)) {
@@ -2515,8 +2515,8 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
         continue;
       }
 
-	      if (isOuterLaneBand(band)) {
-	        const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, laneStopsForBand(band), defaultLaneStopDistance, nodeAnchors);
+      if (isOuterLaneBand(band)) {
+        const stoppedLaneSpans = visibleLaneSpansAroundStops(centerline, laneStopsForBand(band), defaultLaneStopDistance, nodeAnchors);
         const bridgeCumulative = stoppedLaneSpans.bridgeSpans.length > 0 ? polylineCumulativeLengths(centerline) : [];
         for (const stop of stoppedLaneSpans.stops) {
           const key = `${chain.id}:${chainLayer}:${band.id}:${stop.nodeId}:${stop.point.x.toFixed(2)}:${stop.point.y.toFixed(2)}`;
