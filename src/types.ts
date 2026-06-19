@@ -55,6 +55,9 @@ export interface LaneBand {
   zIndex: number;
 }
 
+export type TurnFitState = "normal" | "borrowed" | "clustered" | "fallback";
+export type TurnClusterType = "short-segment" | "adjacent" | "sequence" | "u-turn";
+
 export interface TurnSpec {
   idx: number;
   u: Point;
@@ -65,6 +68,17 @@ export interface TurnSpec {
   sigma: number;
   radius: number;
   ell: number;
+  minStableRadius: number;
+  targetRadius: number;
+  requiredEll: number;
+  availableEll: number;
+  fitState: TurnFitState;
+  windowStartIndex: number;
+  windowEndIndex: number;
+  windowStartDistance: number;
+  windowEndDistance: number;
+  clusterType?: TurnClusterType;
+  fallbackResolved?: boolean;
   warning?: string;
 }
 

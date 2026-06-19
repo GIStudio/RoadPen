@@ -624,6 +624,7 @@ function buildVirtualLaneTurn(
   const minEll = minRadius * Math.tan(delta / 2);
   const ell = Math.max(ellHint, JUNCTION_LANE_MIN_TURN_RADIUS * 0.6, minEll);
   const radius = Math.max(ell / Math.tan(delta / 2), JUNCTION_LANE_MIN_TURN_RADIUS);
+  const requiredEll = radius * Math.tan(delta / 2);
 
   return {
     idx: 0,
@@ -635,6 +636,15 @@ function buildVirtualLaneTurn(
     sigma: cr >= 0 ? 1 : -1,
     radius,
     ell,
+    minStableRadius: minRadius,
+    targetRadius: radius,
+    requiredEll,
+    availableEll: ell,
+    fitState: "normal",
+    windowStartIndex: 0,
+    windowEndIndex: 1,
+    windowStartDistance: 0,
+    windowEndDistance: ell * 2,
     warning: undefined,
   };
 }

@@ -6,7 +6,8 @@ import { createRoot } from "react-dom/client";
 import { DEFAULT_DEBUG_SETTINGS, type DebugSettings, type JunctionInspectorDetails, type Point, type RoadEndMode, type RoadInspectorDetails, type RoadPenScene, type SceneNode, type ToolbarAction, type ToolbarState } from "./types";
 import { exportScene, parseRoadPenScene } from "./io/io";
 import { exportRoadSvg } from "./io/svgExport";
-import { buildRoadBandPolygons, renderRoads } from "./render/roadRenderer";
+import { renderRoadPaint } from "./render/roadRenderer";
+import { getRoadGeometryCache as resolveRoadGeometryCache, getRoadPaintCache as resolveRoadPaintCache, type RoadGeometryRenderCache } from "./render/roadRenderCache";
 import { ToolbarApp } from "./ui/ToolbarApp";
 import { commitRoadWithTopology, findPathRoadIntersections, findSnapTarget, type DraftAnchor, type SnapTarget } from "./geometry/topology";
 import { findRoadAtPoint } from "./geometry/roadPicking";
@@ -95,6 +96,9 @@ window.__roadpenDispose?.();
 let graph: any = null;
 let raf = 0;
 let sceneWarnings: string[] = [];
+let sceneGeometryVersion = 0;
+let geometryCache: RoadGeometryRenderCache | null = null;
+let intersectionPreviewCache: { key: string; points: Point[] } | null = null;
 const cleanupCallbacks: Array<() => void> = [];
 
 function addManagedEventListener(target: EventTarget, type: string, listener: EventListener): void {
@@ -235,6 +239,21 @@ function edgeRoadLayer(edge: RoadPenScene["edges"][number]): number {
   return normalizeRoadLayer(edge.layer);
 }
 
+function invalidateSceneGeometry(): void {
+  sceneGeometryVersion += 1;
+  geometryCache = null;
+  intersectionPreviewCache = null;
+}
+
+function getRoadGeometryCache(): RoadGeometryRenderCache {
+  geometryCache = resolveRoadGeometryCache(geometryCache, app.scene, sceneGeometryVersion);
+  return geometryCache;
+}
+
+function getRoadPaintCache(isolatedJunctionBlockId: string | null) {
+  return resolveRoadPaintCache(getRoadGeometryCache(), isolatedJunctionBlockId);
+}
+
 function findSnapNode(point: Point, excludeId?: string): { id: string; point: Point } | null {
   let hit: { id: string; point: Point; dist: number } | null = null;
   for (const node of app.scene.nodes) {
@@ -300,6 +319,7 @@ function clearDraft(): void {
   app.draftAnchors = [];
   app.draftStartNodeId = null;
   app.snapPreview = null;
+  intersectionPreviewCache = null;
 }
 
 function candidatePreviewPath(): Point[] | null {
@@ -313,13 +333,33 @@ function candidatePreviewPath(): Point[] | null {
   return path;
 }
 
-function candidateIntersectionPoints(): Point[] {
-  const path = candidatePreviewPath();
-  return path ? findPathRoadIntersections(app.scene, path, true, { activeLayer: app.selectedRoadLayer }).map((hit) => hit.point) : [];
+function previewPathCacheKey(path: Point[]): string {
+  return [
+    sceneGeometryVersion,
+    app.selectedRoadLayer,
+    path.map((point) => `${point.x.toFixed(3)},${point.y.toFixed(3)}`).join("|"),
+  ].join(":");
 }
 
-function snapStatusText(): string | null {
-  if (candidateIntersectionPoints().length > 0) {
+function candidateIntersectionPoints(): Point[] {
+  const path = candidatePreviewPath();
+  if (!path) {
+    intersectionPreviewCache = null;
+    return [];
+  }
+
+  const key = previewPathCacheKey(path);
+  if (intersectionPreviewCache?.key === key) {
+    return intersectionPreviewCache.points;
+  }
+
+  const points = findPathRoadIntersections(app.scene, path, true, { activeLayer: app.selectedRoadLayer }).map((hit) => hit.point);
+  intersectionPreviewCache = { key, points };
+  return points;
+}
+
+function snapStatusText(intersectionPreview: Point[]): string | null {
+  if (intersectionPreview.length > 0) {
     return "检测到十字交叉，将自动生成路口";
   }
   if (!app.snapPreview || app.snapPreview.type === "free") {
@@ -339,7 +379,7 @@ function polylineLength(points: Point[]): number {
   return total;
 }
 
-function selectedRoadDetails(roadData = buildRoadBandPolygons(app.scene)): RoadInspectorDetails | null {
+function selectedRoadDetails(roadData = getRoadGeometryCache().roadData): RoadInspectorDetails | null {
   if (!app.selectedEdgeId) {
     return null;
   }
@@ -411,7 +451,7 @@ function pointInPolygon(point: Point, polygon: Point[]): boolean {
   return inside;
 }
 
-function selectedJunctionDetails(roadData = buildRoadBandPolygons(app.scene)): JunctionInspectorDetails | null {
+function selectedJunctionDetails(roadData = getRoadGeometryCache().roadData): JunctionInspectorDetails | null {
   if (!app.selectedJunctionBlockId) {
     return null;
   }
@@ -445,7 +485,7 @@ function selectedJunctionDetails(roadData = buildRoadBandPolygons(app.scene)): J
 }
 
 function findJunctionBlockAtPoint(point: Point): string | null {
-  const roadData = buildRoadBandPolygons(app.scene);
+  const roadData = getRoadGeometryCache().roadData;
   let nearest: { id: string; distance: number } | null = null;
 
   for (const block of roadData.junctionBlocks) {
@@ -463,7 +503,7 @@ function findJunctionBlockAtPoint(point: Point): string | null {
 }
 
 function emitToolbarState(): void {
-  const roadData = buildRoadBandPolygons(app.scene);
+  const roadData = getRoadGeometryCache().roadData;
   const nextState: ToolbarState = {
     mode: app.mode,
     endMode: app.selectedEndMode,
@@ -514,13 +554,18 @@ function handleToolbarAction(action: ToolbarAction): void {
     case "setRoadLayer":
       app.selectedRoadLayer = normalizeRoadLayer(action.layer);
       app.snapPreview = null;
+      intersectionPreviewCache = null;
       requestRender();
       return;
     case "setSelectedRoadLayer": {
       const edge = app.scene.edges.find((item) => item.id === action.edgeId);
-      if (edge) {
-        edge.layer = normalizeRoadLayer(action.layer);
+      const nextLayer = normalizeRoadLayer(action.layer);
+      if (edge && edgeRoadLayer(edge) !== nextLayer) {
+        edge.layer = nextLayer;
         app.selectedRoadLayer = edge.layer;
+        invalidateSceneGeometry();
+      } else if (edge) {
+        app.selectedRoadLayer = nextLayer;
       }
       requestRender();
       return;
@@ -570,6 +615,7 @@ function handleToolbarAction(action: ToolbarAction): void {
 
 function loadValidationScene(): void {
   app.scene = buildParkingLotValidationScene();
+  invalidateSceneGeometry();
   app.mode = "select";
   app.selectedRoadLayer = 0;
   app.selectedEdgeId = null;
@@ -682,6 +728,7 @@ function bindGraphEvents(): void {
       }
     }
 
+    invalidateSceneGeometry();
     requestRender();
   });
 
@@ -713,6 +760,7 @@ function bindGraphEvents(): void {
           edge.controlPoints[edge.controlPoints.length - 1] = { ...snapped.point };
         }
       }
+      invalidateSceneGeometry();
       requestRender();
       return;
     }
@@ -838,6 +886,7 @@ function addEdgeFromDraft(chain = false): void {
   }
 
   sceneWarnings = result.warnings;
+  invalidateSceneGeometry();
   syncGraph();
 
   if (chain) {
@@ -909,23 +958,28 @@ function requestRender(): void {
     const height = roadCanvas.clientHeight;
     ctx.fillStyle = CANVAS_BG;
     ctx.fillRect(0, 0, width, height);
-    const warnings = renderRoads(ctx, app.scene, {
+    const isolatedJunctionBlockId = app.debug.isolateSelectedJunction ? app.selectedJunctionBlockId : null;
+    const roadGeometry = getRoadGeometryCache();
+    const roadPaint = getRoadPaintCache(isolatedJunctionBlockId);
+    const intersectionPreview = candidateIntersectionPoints();
+    const warnings = renderRoadPaint(ctx, roadGeometry.roadData, roadPaint, {
+      scene: app.scene,
       width,
       height,
       backgroundColor: CANVAS_BG,
       draftPoints: app.draftPoints,
       snapPreview: app.snapPreview,
-      intersectionPreview: candidateIntersectionPoints(),
+      intersectionPreview,
       debug: app.debug,
       selectedEdgeId: app.selectedEdgeId,
       selectedJunctionBlockId: app.selectedJunctionBlockId,
-      isolatedJunctionBlockId: app.debug.isolateSelectedJunction ? app.selectedJunctionBlockId : null,
+      isolatedJunctionBlockId,
     });
     const allWarnings = [...new Set([...sceneWarnings, ...warnings])];
     updateWarningPanel(allWarnings);
 
     if (app.mode === "draw") {
-      const snapText = snapStatusText();
+      const snapText = snapStatusText(intersectionPreview);
       const layerText = `层级 ${app.selectedRoadLayer}`;
       statusBar.textContent =
         snapText
@@ -1027,6 +1081,7 @@ function importFromFile(file: File): void {
     const { scene, warnings } = parseRoadPenScene(text);
     sceneWarnings = warnings;
     app.scene = scene;
+    invalidateSceneGeometry();
     app.selectedEdgeId = null;
     app.selectedJunctionBlockId = null;
     app.debug = { ...app.debug, isolateSelectedJunction: false };

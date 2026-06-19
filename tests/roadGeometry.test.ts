@@ -146,4 +146,110 @@ describe("roadGeometry", () => {
     expect(turns.size).toBe(2);
     expect([...turns.values()].some((spec) => spec === null || Boolean(spec))).toBe(true);
   });
+
+  test("短相邻段有外部空间时应借用 turn window 保持稳定半径", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 80, y: 0 },
+      { x: 84, y: 0 },
+      { x: 84, y: 80 },
+    ];
+    const turns = computeTurnSpecs(points, 8, { angleThresholdDeg: 1 });
+    const turn = turns.get(2);
+
+    expect(turn?.fitState).toBe("borrowed");
+    expect(turn?.radius).toBeGreaterThanOrEqual(turn?.minStableRadius ?? Number.POSITIVE_INFINITY);
+    expect(turn?.availableEll).toBeGreaterThanOrEqual(turn?.requiredEll ?? Number.POSITIVE_INFINITY);
+  });
+
+  test("连续短 zigzag 应聚合为 clustered turn 并跳过内部控制点", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 80, y: 0 },
+      { x: 86, y: 3 },
+      { x: 80, y: 6 },
+      { x: 86, y: 9 },
+      { x: 80, y: 12 },
+      { x: 86, y: 15 },
+      { x: 160, y: 15 },
+    ];
+    const turns = computeTurnSpecs(points, 6, { angleThresholdDeg: 1 });
+    const clustered = [...turns.values()].find((turn) => turn?.fitState === "clustered");
+    const skeleton = buildSkeletonPathByPoints(points, 6, { samplesPerTurn: 12, turnOptions: { angleThresholdDeg: 1 } });
+
+    expect(clustered).toBeTruthy();
+    expect(clustered?.windowEndIndex).toBeGreaterThan(clustered?.idx ?? 0);
+    expect(skeleton.some((point) => Math.abs(point.x - 86) < 1e-6 && Math.abs(point.y - 3) < 1e-6)).toBe(false);
+  });
+
+  test("空间不足的短转弯应标记 fallback 而不是生成负 offset 半径", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 8, y: 0 },
+      { x: 8, y: 8 },
+      { x: 16, y: 8 },
+    ];
+    const turns = computeTurnSpecs(points, 20, { angleThresholdDeg: 1, maxBorrowSpan: 24, shortSegmentCluster: false });
+    const fallback = [...turns.values()].find((turn) => turn?.fitState === "fallback");
+
+    expect(fallback).toBeTruthy();
+    expect(fallback?.radius).toBeGreaterThan(0);
+    expect(fallback?.radius).toBeLessThan(fallback?.minStableRadius ?? 0);
+  });
+
+  test("连续同向急转应合并为一个 turn window，避免双 fallback 互相裁切", () => {
+    const points: Point[] = [
+      { x: 0, y: 0 },
+      { x: 120, y: 0 },
+      { x: 170, y: 50 },
+      { x: 120, y: 100 },
+    ];
+    const turns = computeTurnSpecs(points, 28, { angleThresholdDeg: 1 });
+    const turnSpecs = [...turns.values()].filter(Boolean);
+    const skeleton = buildSkeletonPathByPoints(points, 28, { samplesPerTurn: 12, turnOptions: { angleThresholdDeg: 1 } });
+
+    expect(turnSpecs).toHaveLength(1);
+    expect(turnSpecs[0]?.fitState).toMatch(/clustered|fallback/);
+    expect(turnSpecs[0]?.windowEndIndex).toBeGreaterThan(2);
+    expect(skeleton.some((point) => Math.abs(point.x - 170) < 1e-6 && Math.abs(point.y - 50) < 1e-6)).toBe(false);
+  });
+
+  test("V 型自折返应进入 u-turn fallback，而不是生成极小正常转弯", () => {
+    const points: Point[] = [
+      { x: 1529.38, y: 102.26 },
+      { x: 1389.16, y: 229.32 },
+      { x: 1594.78, y: 100.13 },
+    ];
+    const turns = computeTurnSpecs(points, 28, { angleThresholdDeg: 1 });
+    const turn = turns.get(1);
+    const skeleton = buildSkeletonPathByPoints(points, 28, { samplesPerTurn: 12, turnOptions: { angleThresholdDeg: 1 } });
+
+    expect(turn?.fitState).toBe("fallback");
+    expect(turn?.clusterType).toBe("u-turn");
+    expect(turn?.fallbackResolved).toBe(true);
+    expect(turn?.radius).toBeGreaterThan(0);
+    expect(turn?.radius).toBeLessThan(turn?.minStableRadius ?? 0);
+    expect(skeleton.some((point) => Math.abs(point.x - points[1].x) < 1e-6 && Math.abs(point.y - points[1].y) < 1e-6)).toBe(false);
+  });
+
+  test("连续风险折线应合并为 sequence window，避免多个 fallback 独立裁切", () => {
+    const points: Point[] = [
+      { x: 341.3, y: 173.96 },
+      { x: 427.23, y: 203.97 },
+      { x: 547.38, y: 245.92 },
+      { x: 414.97, y: 306.2 },
+      { x: 182.09, y: 412.21 },
+      { x: 398.56, y: 443.04 },
+      { x: 540.59, y: 463.27 },
+      { x: 386.21, y: 545.99 },
+      { x: 236.15, y: 626.4 },
+    ];
+    const turns = computeTurnSpecs(points, 28, { angleThresholdDeg: 1 });
+    const turnSpecs = [...turns.values()].filter(Boolean);
+    const sequence = turnSpecs.find((turn) => turn?.clusterType === "sequence" || turn?.clusterType === "u-turn");
+
+    expect(sequence).toBeTruthy();
+    expect(sequence?.windowEndIndex).toBeGreaterThan(sequence?.idx ?? 0);
+    expect(turnSpecs.length).toBeLessThan(points.length - 2);
+  });
 });

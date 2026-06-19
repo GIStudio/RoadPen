@@ -126,6 +126,39 @@ describe("road geometry diagnostics", () => {
     expect(data.geometryIssues.counts.localZOrderApplied).toBe(1);
   });
 
+  test("经过真实路口的自交 visual chain 不应同时应用 local z 覆盖", () => {
+    const scene = sceneWithEdges(
+      [
+        road("approach", "a", "junction", [
+          { x: -80, y: -80 },
+          { x: 80, y: 80 },
+          { x: -80, y: 80 },
+        ]),
+        road("exit", "junction", "b", [
+          { x: -80, y: 80 },
+          { x: -160, y: 80 },
+          { x: 80, y: -80 },
+        ]),
+        road("branch", "junction", "c", [
+          { x: -80, y: 80 },
+          { x: -80, y: 160 },
+        ]),
+      ],
+      [
+        { id: "a", x: -80, y: -80 },
+        { id: "junction", x: -80, y: 80 },
+        { id: "b", x: 80, y: -80 },
+        { id: "c", x: -80, y: 160 },
+      ],
+    );
+    const data = buildRoadBandPolygons(scene);
+
+    expect(data.junctionBlocks.some((block) => block.nodeId === "junction")).toBe(true);
+    expect(data.geometryIssues.counts.selfOverlapCandidate).toBeGreaterThanOrEqual(1);
+    expect(data.geometryIssues.counts.localZOrderApplied).toBe(0);
+    expect(data.localZOrderSlices).toHaveLength(0);
+  });
+
   test("渲染旧拓扑时应忽略贴近路口的非节点控制点", () => {
     const scene = sceneWithEdges(
       [

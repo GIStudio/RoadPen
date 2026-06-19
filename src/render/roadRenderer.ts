@@ -26,6 +26,10 @@ interface RenderContext {
   isolatedJunctionBlockId?: string | null;
 }
 
+interface RoadPaintRenderContext extends RenderContext {
+  scene: RoadPenScene;
+}
+
 export interface BandBucket {
   roadLayer: number;
   semanticBandId: string;
@@ -119,9 +123,58 @@ export interface RoadBandData {
       radius: number;
       ell: number;
       deltaDeg: number;
+      minStableRadius: number;
+      targetRadius: number;
+      requiredEll: number;
+      availableEll: number;
+      fitState: TurnSpec["fitState"];
+      clusterType?: TurnSpec["clusterType"];
+      fallbackResolved?: boolean;
     }>;
   }>;
   warnings: string[];
+}
+
+export type RoadPaintRingSet = Point[][];
+
+export interface RoadPaintBucket {
+  roadLayer: number;
+  semanticBandId: string;
+  band: LaneBand;
+  polygonCount: number;
+  ringSets: RoadPaintRingSet[];
+}
+
+export interface RoadPaintLocalSliceBand {
+  semanticBandId: string;
+  band: LaneBand;
+  ringSets: RoadPaintRingSet[];
+}
+
+export interface RoadPaintLocalSlice {
+  chainId: string;
+  layer: number;
+  edgeIds: string[];
+  sliceIndex: number;
+  reason: LocalZOrderSlice["reason"];
+  point: Point;
+  footprintRingSets: RoadPaintRingSet[];
+  bands: RoadPaintLocalSliceBand[];
+}
+
+export interface RoadPaintLayer {
+  roadLayer: number;
+  footprintPolygonCount: number;
+  footprintRingSets: RoadPaintRingSet[];
+  buckets: RoadPaintBucket[];
+  localSlices: RoadPaintLocalSlice[];
+}
+
+export interface RoadPaintCache {
+  isolatedJunctionBlockId: string | null;
+  sourceBucketCount: number;
+  allPolygons: Point[][];
+  layers: RoadPaintLayer[];
 }
 
 export type RoadSegmentGeometry = RoadBandData["edgeCenterlines"][number];
@@ -379,6 +432,15 @@ interface DistanceInterval {
   end: number;
 }
 
+interface TurnFallbackWindow {
+  start: number;
+  end: number;
+  turnIndex: number;
+  turn: TurnSpec;
+  turns: TurnSpec[];
+  point: Point;
+}
+
 interface ConnectorStopEntry {
   junctionBlockId: string;
   edgeId: string;
@@ -554,57 +616,84 @@ function closePolygon(points: Point[]): Point[] {
   return [...points, { ...first }];
 }
 
-function sampleExtremeTurnCenterline(turn: TurnSpec, samples = 18): Point[] {
-  const sampleCount = Math.max(6, Math.floor(samples));
-  const handle = (4 / 3) * turn.radius * Math.tan(turn.delta / 4);
-  const c1 = addPoint(turn.a, scalePoint(turn.u, handle));
-  const c2 = addPoint(turn.b, scalePoint(turn.v, -handle));
-  const points: Point[] = [];
+function adaptiveTurnSampleCount(turn: TurnSpec, requested = 24): number {
+  const arcLength = Math.max(0, Math.max(turn.radius, turn.minStableRadius) * turn.delta);
+  return Math.min(Math.max(6, Math.ceil(arcLength / 6)), Math.max(6, Math.min(24, Math.floor(requested))));
+}
+
+function directionOnPolylineAt(points: Point[], cumulative: number[], target: number, forward: boolean): Point {
+  if (points.length < 2) {
+    return { x: 1, y: 0 };
+  }
+  const total = cumulative[cumulative.length - 1] ?? 0;
+  const clamped = Math.max(0, Math.min(total, target));
+  for (let i = 1; i < cumulative.length; i += 1) {
+    if (clamped > cumulative[i] + EPS) {
+      continue;
+    }
+    const segmentIndex = forward && Math.abs(clamped - cumulative[i]) <= 1e-6 && i + 1 < points.length ? i + 1 : i;
+    const a = points[Math.max(0, segmentIndex - 1)];
+    const b = points[Math.min(points.length - 1, segmentIndex)];
+    return unitPoint(subPoint(b, a)) ?? { x: 1, y: 0 };
+  }
+  return unitPoint(subPoint(points[points.length - 1], points[points.length - 2])) ?? { x: 1, y: 0 };
+}
+
+function cubicFallbackWindowCenterline(points: Point[], window: TurnFallbackWindow, samples = 24): Point[] {
+  const cumulative = polylineCumulativeLengths(points);
+  const start = pointOnPolylineAt(points, cumulative, window.start);
+  const end = pointOnPolylineAt(points, cumulative, window.end);
+  const entry = directionOnPolylineAt(points, cumulative, window.start, true);
+  const exit = directionOnPolylineAt(points, cumulative, window.end, true);
+  const span = Math.max(0, window.end - window.start);
+  const stableRadius = Math.max(window.turn.radius, window.turn.minStableRadius);
+  const bezierHandle = (4 / 3) * stableRadius * Math.tan(window.turn.delta / 4);
+  const handle = Math.min(Math.max(8, span * 0.45), Math.max(8, bezierHandle));
+  const sampleCount = Math.min(Math.max(6, Math.ceil(span / 10)), Math.max(6, Math.min(24, Math.floor(samples))));
+  const c1 = addPoint(start, scalePoint(entry, handle));
+  const c2 = addPoint(end, scalePoint(exit, -handle));
+  const sampled: Point[] = [];
   for (let i = 0; i <= sampleCount; i += 1) {
     const t = i / sampleCount;
     const mt = 1 - t;
-    points.push({
-      x: mt * mt * mt * turn.a.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * turn.b.x,
-      y: mt * mt * mt * turn.a.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * turn.b.y,
+    sampled.push({
+      x: mt * mt * mt * start.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * end.x,
+      y: mt * mt * mt * start.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * end.y,
     });
   }
-  return points;
+  return sampled;
 }
 
-function buildExtremeTurnFallbackPolygons(center: Point, turn: TurnSpec, band: LaneBand): Point[][] {
+function buildBevelFallbackWindowPolygon(points: Point[], window: TurnFallbackWindow, band: LaneBand): Point[] {
+  const cumulative = polylineCumulativeLengths(points);
+  const start = pointOnPolylineAt(points, cumulative, window.start);
+  const end = pointOnPolylineAt(points, cumulative, window.end);
+  const entry = directionOnPolylineAt(points, cumulative, window.start, true);
+  const exit = directionOnPolylineAt(points, cumulative, window.end, true);
   const minQ = Math.min(band.qInner, band.qOuter);
   const maxQ = Math.max(band.qInner, band.qOuter);
-  const deltaDeg = (turn.delta * 180) / Math.PI;
-  if (deltaDeg < 150) {
-    return [closePolygon([
-      offsetPoint(turn.a, turn.u, maxQ),
-      offsetPoint(center, turn.u, maxQ),
-      offsetPoint(center, turn.v, maxQ),
-      offsetPoint(turn.b, turn.v, maxQ),
-      offsetPoint(turn.b, turn.v, minQ),
-      offsetPoint(center, turn.v, minQ),
-      offsetPoint(center, turn.u, minQ),
-      offsetPoint(turn.a, turn.u, minQ),
-    ])];
-  }
+  return closePolygon([
+    offsetPoint(start, entry, maxQ),
+    offsetPoint(end, exit, maxQ),
+    offsetPoint(end, exit, minQ),
+    offsetPoint(start, entry, minQ),
+  ]);
+}
 
-  const turnCenterline = sampleExtremeTurnCenterline(turn, 32);
+function buildExtremeTurnFallbackPolygons(points: Point[], window: TurnFallbackWindow, band: LaneBand): Point[][] {
+  const turnCenterline = cubicFallbackWindowCenterline(points, window, 24);
   const sweptPolygon = buildSmoothBandPolygon(turnCenterline, band.qInner, band.qOuter);
   if (validPolygon(sweptPolygon)) {
     return [sweptPolygon];
   }
 
-  return [closePolygon([
-    offsetPoint(turn.a, turn.u, maxQ),
-    offsetPoint(turn.b, turn.v, maxQ),
-    offsetPoint(turn.b, turn.v, minQ),
-    offsetPoint(turn.a, turn.u, minQ),
-  ])];
+  const bevelPolygon = buildBevelFallbackWindowPolygon(points, window, band);
+  return validPolygon(bevelPolygon) ? [bevelPolygon] : [];
 }
 
 function turnNeedsLocalFallback(turn: TurnSpec, band: LaneBand): boolean {
   const bandMaxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
-  return Boolean(turn.warning) || turn.radius <= bandMaxOffset + 1 || turn.ell <= bandMaxOffset * 0.75;
+  return turn.fitState === "fallback" || turn.radius <= bandMaxOffset + 1 || turn.ell <= bandMaxOffset * 0.75;
 }
 
 export function buildRoadLayerFootprints(bandBuckets: Map<string, BandBucket>): RoadLayerFootprint[] {
@@ -1029,21 +1118,79 @@ function splitPolylineByExcludedIntervals(points: Point[], intervals: DistanceIn
   return spans;
 }
 
+function representativeFallbackTurn(turns: TurnSpec[]): TurnSpec {
+  return turns.reduce((best, turn) => {
+    const bestScore = best.delta + (best.fitState === "fallback" ? 10 : 0);
+    const score = turn.delta + (turn.fitState === "fallback" ? 10 : 0);
+    return score > bestScore ? turn : best;
+  }, turns[0]);
+}
+
+function buildTurnFallbackWindows(
+  points: Point[],
+  turns: TurnSpec[],
+  band: LaneBand,
+  options: { useTurnWindowDistances?: boolean } = {},
+): TurnFallbackWindow[] {
+  if (turns.length === 0) {
+    return [];
+  }
+  const cumulative = polylineCumulativeLengths(points);
+  const total = cumulative[cumulative.length - 1] ?? 0;
+  const bandMaxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
+  const maxProjectionDistance = Math.max(10, bandMaxOffset * 1.5);
+  const mergeGap = Math.max(4, bandMaxOffset * 0.75);
+  const intervals: Array<DistanceInterval & { turn: TurnSpec; turnIndex: number }> = [];
+  for (const turn of turns) {
+    let startDistance = turn.windowStartDistance;
+    let endDistance = turn.windowEndDistance;
+    if (!options.useTurnWindowDistances) {
+      const start = projectPointToPolylineDistance(points, turn.a);
+      const end = projectPointToPolylineDistance(points, turn.b);
+      if (!start || !end || start.distanceToPath > maxProjectionDistance || end.distanceToPath > maxProjectionDistance) {
+        continue;
+      }
+      startDistance = start.distanceAlong;
+      endDistance = end.distanceAlong;
+    }
+    const start = Math.max(0, Math.min(total, Math.min(startDistance, endDistance)));
+    const end = Math.max(0, Math.min(total, Math.max(startDistance, endDistance)));
+    if (end - start <= EPS) {
+      continue;
+    }
+    intervals.push({ start, end, turn, turnIndex: turn.idx });
+  }
+  const merged: Array<DistanceInterval & { turns: TurnSpec[]; turnIndex: number }> = [];
+  for (const interval of intervals.sort((a, b) => a.start - b.start)) {
+    const last = merged[merged.length - 1];
+    if (last && interval.start <= last.end + mergeGap) {
+      last.end = Math.max(last.end, interval.end);
+      last.turns.push(interval.turn);
+      last.turnIndex = representativeFallbackTurn(last.turns).idx;
+    } else {
+      merged.push({ start: interval.start, end: interval.end, turns: [interval.turn], turnIndex: interval.turnIndex });
+    }
+  }
+
+  return merged.map((interval) => {
+    const turn = representativeFallbackTurn(interval.turns);
+    const point = pointOnPolylineAt(points, cumulative, (interval.start + interval.end) * 0.5);
+    return {
+      start: interval.start,
+      end: interval.end,
+      turnIndex: interval.turnIndex,
+      turn,
+      turns: interval.turns,
+      point,
+    };
+  });
+}
+
 function splitPolylineAroundTurnFallbacks(points: Point[], turns: TurnSpec[], band: LaneBand): Point[][] {
   if (turns.length === 0) {
     return [points.map((point) => ({ ...point }))];
   }
-  const bandMaxOffset = Math.max(Math.abs(band.qInner), Math.abs(band.qOuter));
-  const maxProjectionDistance = Math.max(10, bandMaxOffset * 1.5);
-  const intervals: DistanceInterval[] = [];
-  for (const turn of turns) {
-    const start = projectPointToPolylineDistance(points, turn.a);
-    const end = projectPointToPolylineDistance(points, turn.b);
-    if (!start || !end || start.distanceToPath > maxProjectionDistance || end.distanceToPath > maxProjectionDistance) {
-      continue;
-    }
-    intervals.push({ start: start.distanceAlong, end: end.distanceAlong });
-  }
+  const intervals = buildTurnFallbackWindows(points, turns, band).map((window) => ({ start: window.start, end: window.end }));
   return splitPolylineByExcludedIntervals(points, intervals, 4);
 }
 
@@ -1710,16 +1857,21 @@ function drawRingSet(ctx: CanvasRenderingContext2D, ringSet: Point[][]): void {
   }
 }
 
-function drawMergedPolygons(
+export function mergePolygonsToRingSets(polygons: Point[][]): RoadPaintRingSet[] {
+  if (polygons.length === 0) {
+    return [];
+  }
+  return multiPolygonToRings(mergeRoadJunction(polygons));
+}
+
+function drawRingSets(
   ctx: CanvasRenderingContext2D,
-  polygons: Point[][],
+  ringSets: RoadPaintRingSet[],
   fillStyle: string,
   strokeStyle?: string,
   strokeWidth = 1,
 ): void {
-  const merged = mergeRoadJunction(polygons);
-  const rings = multiPolygonToRings(merged);
-  for (const ringSet of rings) {
+  for (const ringSet of ringSets) {
     if (ringSet.length === 0) {
       continue;
     }
@@ -1736,11 +1888,11 @@ function drawMergedPolygons(
   }
 }
 
-function drawLocalZOrderSlices(ctx: CanvasRenderingContext2D, slices: LocalZOrderSlice[], backgroundColor: string): void {
+function drawLocalZOrderSlices(ctx: CanvasRenderingContext2D, slices: RoadPaintLocalSlice[], backgroundColor: string): void {
   for (const slice of slices.sort((a, b) => a.sliceIndex - b.sliceIndex)) {
-    drawMergedPolygons(ctx, slice.footprint, backgroundColor);
+    drawRingSets(ctx, slice.footprintRingSets, backgroundColor);
     for (const item of slice.bands.slice().sort((a, b) => a.band.zIndex - b.band.zIndex)) {
-      drawMergedPolygons(ctx, [item.polygon], item.band.color, "rgba(8, 14, 29, 0.8)");
+      drawRingSets(ctx, item.ringSets, item.band.color, "rgba(8, 14, 29, 0.8)");
     }
   }
 }
@@ -2025,7 +2177,7 @@ function drawDebugOverlay(ctx: CanvasRenderingContext2D, data: RoadBandData, deb
         ctx.stroke();
         drawDebugLabel(
           ctx,
-          `${chain.id} turn p${index}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}\nr=${turn.radius.toFixed(1)} ell=${turn.ell.toFixed(1)} d=${turn.deltaDeg.toFixed(0)}`,
+          `${chain.id} turn p${index} ${turn.fitState}${turn.clusterType ? `/${turn.clusterType}` : ""}${turn.fallbackResolved ? " resolved" : ""}\n${point.x.toFixed(1)}, ${point.y.toFixed(1)}\nr=${turn.radius.toFixed(1)} min=${turn.minStableRadius.toFixed(1)}\nell=${turn.ell.toFixed(1)} req=${turn.requiredEll.toFixed(1)} avail=${turn.availableEll.toFixed(1)} d=${turn.deltaDeg.toFixed(0)}`,
           point,
           "#fde68a",
         );
@@ -2218,7 +2370,15 @@ function buildLocalZOrderSlicesForChain(
   sourceCenterline: Point[],
   centerline: Point[],
   bands: LaneBand[],
+  degrees: Map<string, number>,
 ): LocalZOrderSlice[] {
+  const hasInternalAtGradeJunction = chain.nodeIds
+    .slice(1, -1)
+    .some((nodeId) => (degrees.get(nodeId) ?? 0) >= 3);
+  if (hasInternalAtGradeJunction) {
+    return [];
+  }
+
   if (!findCenterlineSelfIntersection(centerline)) {
     return [];
   }
@@ -2379,7 +2539,7 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     const chainSelfIntersection = findCenterlineSelfIntersection(centerline);
     const allowSelfIntersectionFallback = !chainSelfIntersection;
     if (chainSelfIntersection) {
-      localZOrderSlices.push(...buildLocalZOrderSlicesForChain(chain, sourceCenterline, centerline, bands));
+      localZOrderSlices.push(...buildLocalZOrderSlicesForChain(chain, sourceCenterline, centerline, bands, degrees));
     }
     const nodeAnchors = nodeDistanceAnchorsForChain(chain, nodeMap, centerline);
     const defaultLaneStopDistance = Math.max(18, maxOffset * 1.1);
@@ -2443,6 +2603,13 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
           radius: turn.radius,
           ell: turn.ell,
           deltaDeg: (turn.delta * 180) / Math.PI,
+          minStableRadius: turn.minStableRadius,
+          targetRadius: turn.targetRadius,
+          requiredEll: turn.requiredEll,
+          availableEll: turn.availableEll,
+          fitState: turn.fitState,
+          clusterType: turn.clusterType,
+          fallbackResolved: turn.fallbackResolved,
         }]
           : [],
       ),
@@ -2457,19 +2624,18 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
     for (const band of bands) {
       const semanticBand = semanticBandForBucket(band);
       const fallbackTurnsForBand = [...turns.values()].filter((turn): turn is TurnSpec => Boolean(turn && turnNeedsLocalFallback(turn, band)));
+      const fallbackWindowsForBand = buildTurnFallbackWindows(sourceCenterline, fallbackTurnsForBand, band, { useTurnWindowDistances: true });
       const buildRenderableBandPolygons = (span: Point[]): Point[][] =>
         splitPolylineAroundTurnFallbacks(span, fallbackTurnsForBand, band).flatMap((safeSpan) =>
           buildSelfSafeBandPolygons(safeSpan, band, { allowSelfIntersectionFallback }),
         );
-      for (const [turnIndex, turn] of turns.entries()) {
-        if (!turn || !turnNeedsLocalFallback(turn, band)) {
+      for (const window of fallbackWindowsForBand) {
+        const polygons = buildExtremeTurnFallbackPolygons(sourceCenterline, window, band);
+        if (polygons.length === 0) {
+          warnings.add(`道路 ${chain.edgeIds.join("+")}：fallback closure 无法生成 idx=${window.turnIndex}`);
           continue;
         }
-        const center = sourceCenterline[turnIndex];
-        if (!center) {
-          continue;
-        }
-        for (const polygon of buildExtremeTurnFallbackPolygons(center, turn, band)) {
+        for (const polygon of polygons) {
           if (!validPolygon(polygon)) {
             continue;
           }
@@ -2480,11 +2646,11 @@ export function buildRoadBandPolygons(scene: RoadPenScene): RoadBandData {
             bandId: band.id,
             semanticBandId: semanticBand.id,
             edgeIds: [...chain.edgeIds],
-            turnIndex,
-            radius: turn.radius,
-            deltaDeg: (turn.delta * 180) / Math.PI,
+            turnIndex: window.turnIndex,
+            radius: window.turn.radius,
+            deltaDeg: (window.turn.delta * 180) / Math.PI,
             polygon: polygon.map((point) => ({ ...point })),
-            point: { ...center },
+            point: { ...window.point },
           });
         }
       }
@@ -2645,18 +2811,8 @@ export function buildRoadNetworkGeometry(scene: RoadPenScene): RoadNetworkGeomet
   };
 }
 
-export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPenScene, params: RenderContext): string[] {
-  if (!ctx) {
-    return [];
-  }
-
-  const { width, height, draftPoints, snapPreview, intersectionPreview, debug, selectedEdgeId, selectedJunctionBlockId, isolatedJunctionBlockId } = params;
-  ctx.clearRect(0, 0, width, height);
-
-  const roadData = buildRoadBandPolygons(scene);
-  const { bandBuckets, junctions, warnings: geometryWarnings } = roadData;
-  const visibleBandBuckets = isolatedJunctionBlockId ? buildJunctionOnlyBandBuckets(roadData, isolatedJunctionBlockId) : bandBuckets;
-  const backgroundColor = params.backgroundColor ?? ROAD_BACKGROUND_COLOR;
+export function buildRoadPaintCache(roadData: RoadBandData, isolatedJunctionBlockId: string | null = null): RoadPaintCache {
+  const visibleBandBuckets = isolatedJunctionBlockId ? buildJunctionOnlyBandBuckets(roadData, isolatedJunctionBlockId) : roadData.bandBuckets;
   const visibleFootprints = buildRoadLayerFootprints(visibleBandBuckets);
   const bucketsByLayer = new Map<number, BandBucket[]>();
   for (const bucket of visibleBandBuckets.values()) {
@@ -2664,6 +2820,7 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     buckets.push(bucket);
     bucketsByLayer.set(bucket.roadLayer, buckets);
   }
+
   const localSlicesByLayer = new Map<number, LocalZOrderSlice[]>();
   if (!isolatedJunctionBlockId) {
     for (const slice of roadData.localZOrderSlices) {
@@ -2673,15 +2830,67 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
     }
   }
 
-  visibleFootprints.forEach((footprint, index) => {
+  return {
+    isolatedJunctionBlockId,
+    sourceBucketCount: visibleBandBuckets.size,
+    allPolygons: [...visibleBandBuckets.values()].flatMap((bucket) => bucket.polygons),
+    layers: visibleFootprints.map((footprint) => ({
+      roadLayer: footprint.roadLayer,
+      footprintPolygonCount: footprint.polygons.length,
+      footprintRingSets: mergePolygonsToRingSets(footprint.polygons),
+      buckets: (bucketsByLayer.get(footprint.roadLayer) ?? [])
+        .slice()
+        .sort((a, b) => a.band.zIndex - b.band.zIndex)
+        .map((bucket) => ({
+          roadLayer: bucket.roadLayer,
+          semanticBandId: bucket.semanticBandId,
+          band: { ...bucket.band },
+          polygonCount: bucket.polygons.length,
+          ringSets: mergePolygonsToRingSets(bucket.polygons),
+        })),
+      localSlices: (localSlicesByLayer.get(footprint.roadLayer) ?? [])
+        .slice()
+        .sort((a, b) => a.sliceIndex - b.sliceIndex)
+        .map((slice) => ({
+          chainId: slice.chainId,
+          layer: slice.layer,
+          edgeIds: [...slice.edgeIds],
+          sliceIndex: slice.sliceIndex,
+          reason: slice.reason,
+          point: { ...slice.point },
+          footprintRingSets: mergePolygonsToRingSets(slice.footprint),
+          bands: slice.bands
+            .slice()
+            .sort((a, b) => a.band.zIndex - b.band.zIndex)
+            .map((item) => ({
+              semanticBandId: item.semanticBandId,
+              band: { ...item.band },
+              ringSets: mergePolygonsToRingSets([item.polygon]),
+            })),
+        })),
+    })),
+  };
+}
+
+export function renderRoadPaint(ctx: CanvasRenderingContext2D | null, roadData: RoadBandData, paintCache: RoadPaintCache, params: RoadPaintRenderContext): string[] {
+  if (!ctx) {
+    return [];
+  }
+
+  const { width, height, draftPoints, snapPreview, intersectionPreview, debug, selectedEdgeId, selectedJunctionBlockId, isolatedJunctionBlockId, scene } = params;
+  ctx.clearRect(0, 0, width, height);
+
+  const { junctions, warnings: geometryWarnings } = roadData;
+  const backgroundColor = params.backgroundColor ?? ROAD_BACKGROUND_COLOR;
+
+  paintCache.layers.forEach((layer, index) => {
     if (index > 0) {
-      drawMergedPolygons(ctx, footprint.polygons, backgroundColor);
+      drawRingSets(ctx, layer.footprintRingSets, backgroundColor);
     }
-    const layerBuckets = (bucketsByLayer.get(footprint.roadLayer) ?? []).sort((a, b) => a.band.zIndex - b.band.zIndex);
-    for (const bucket of layerBuckets) {
-      drawMergedPolygons(ctx, bucket.polygons, bucket.band.color, "rgba(8, 14, 29, 0.8)");
+    for (const bucket of layer.buckets) {
+      drawRingSets(ctx, bucket.ringSets, bucket.band.color, "rgba(8, 14, 29, 0.8)");
     }
-    drawLocalZOrderSlices(ctx, localSlicesByLayer.get(footprint.roadLayer) ?? [], backgroundColor);
+    drawLocalZOrderSlices(ctx, layer.localSlices, backgroundColor);
   });
 
   drawSelectedRoad(ctx, scene, selectedEdgeId);
@@ -2729,4 +2938,8 @@ export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPen
   }
 
   return geometryWarnings;
+}
+
+export function renderRoads(ctx: CanvasRenderingContext2D | null, scene: RoadPenScene, roadData: RoadBandData, paintCache: RoadPaintCache, params: RenderContext): string[] {
+  return renderRoadPaint(ctx, roadData, paintCache, { ...params, scene });
 }

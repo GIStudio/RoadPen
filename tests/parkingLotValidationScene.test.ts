@@ -50,6 +50,16 @@ function polygonTouchesProbe(polygon: Point[], probe: Point, radius: number): bo
   return false;
 }
 
+function polygonArea(points: Point[]): number {
+  let area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area / 2;
+}
+
 function bridgeConnects(
   bridge: { fromJunctionBlockId?: string; toJunctionBlockId?: string },
   a: string,
@@ -115,6 +125,22 @@ describe("parking lot validation scene", () => {
       expect(fallback.polygon.length).toBeGreaterThan(8);
     }
     expect([...fallbackCountsByBandAndTurn.values()].every((count) => count === 1)).toBe(true);
+  });
+
+  test("极限折返 fallback 应被 closure 处理，不进入普通 warning 面板", () => {
+    const data = buildRoadBandPolygons(buildParkingLotValidationScene());
+    const riskyTurnChains = data.edgeCenterlines.filter((chain) => chain.edgeIds.some((edgeId) => edgeId === "e-41" || edgeId === "e-42"));
+    const riskyTurns = riskyTurnChains.flatMap((chain) => chain.turns);
+    const fallbackPatches = data.extremeTurnFallbacks.filter((fallback) =>
+      fallback.edgeIds.some((edgeId) => edgeId === "e-41" || edgeId === "e-42"),
+    );
+
+    expect(riskyTurns.some((turn) => turn.fitState === "fallback" && turn.clusterType === "u-turn" && turn.fallbackResolved)).toBe(true);
+    expect(fallbackPatches.length).toBeGreaterThan(0);
+    for (const patch of fallbackPatches) {
+      expect(Math.abs(polygonArea(patch.polygon))).toBeGreaterThan(10);
+    }
+    expect(data.warnings.some((warning) => warning.includes("转折过急") || warning.includes("自适应转弯 fallback"))).toBe(false);
   });
 
   test("lane stop 裁剪点应保持在所属路口 node 附近", () => {

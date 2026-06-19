@@ -1,8 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { deflateSync } from "node:zlib";
-import { buildRoadBandPolygons, buildRoadLayerFootprints, type BandBucket, type RoadBandData } from "../../src/render/roadRenderer";
-import { mergeRoadJunction, multiPolygonToRings } from "../../src/geometry/roadMerge";
+import { buildRoadBandPolygons, buildRoadPaintCache, type RoadBandData, type RoadPaintCache, type RoadPaintRingSet } from "../../src/render/roadRenderer";
 import type { GeometryIssueReport, Point, RoadEdge, RoadPenScene } from "../../src/types";
 
 interface Rgba {
@@ -205,9 +204,8 @@ function fillRingSet(image: Uint8Array, viewport: Viewport, ringSet: Point[][], 
   }
 }
 
-function fillPolygons(image: Uint8Array, viewport: Viewport, polygons: Point[][], color: Rgba): void {
-  const merged = mergeRoadJunction(polygons);
-  for (const ringSet of multiPolygonToRings(merged)) {
+function fillRingSets(image: Uint8Array, viewport: Viewport, ringSets: RoadPaintRingSet[], color: Rgba): void {
+  for (const ringSet of ringSets) {
     fillRingSet(image, viewport, ringSet, color);
   }
 }
@@ -268,33 +266,18 @@ function createImage(width: number, height: number, color: Rgba): Uint8Array {
   return image;
 }
 
-function renderRoadDataIntoImage(image: Uint8Array, viewport: Viewport, data: RoadBandData): void {
-  const footprints = buildRoadLayerFootprints(data.bandBuckets);
-  const bucketsByLayer = new Map<number, BandBucket[]>();
-  for (const bucket of data.bandBuckets.values()) {
-    const buckets = bucketsByLayer.get(bucket.roadLayer) ?? [];
-    buckets.push(bucket);
-    bucketsByLayer.set(bucket.roadLayer, buckets);
-  }
-  const localSlicesByLayer = new Map<number, RoadBandData["localZOrderSlices"]>();
-  for (const slice of data.localZOrderSlices) {
-    const slices = localSlicesByLayer.get(slice.layer) ?? [];
-    slices.push(slice);
-    localSlicesByLayer.set(slice.layer, slices);
-  }
-
-  footprints.forEach((footprint, index) => {
+function renderRoadDataIntoImage(image: Uint8Array, viewport: Viewport, paintCache: RoadPaintCache): void {
+  paintCache.layers.forEach((layer, index) => {
     if (index > 0) {
-      fillPolygons(image, viewport, footprint.polygons, BACKGROUND);
+      fillRingSets(image, viewport, layer.footprintRingSets, BACKGROUND);
     }
-    const buckets = (bucketsByLayer.get(footprint.roadLayer) ?? []).sort((a, b) => a.band.zIndex - b.band.zIndex);
-    for (const bucket of buckets) {
-      fillPolygons(image, viewport, bucket.polygons, parseColor(bucket.band.color));
+    for (const bucket of layer.buckets) {
+      fillRingSets(image, viewport, bucket.ringSets, parseColor(bucket.band.color));
     }
-    for (const slice of (localSlicesByLayer.get(footprint.roadLayer) ?? []).sort((a, b) => a.sliceIndex - b.sliceIndex)) {
-      fillPolygons(image, viewport, slice.footprint, BACKGROUND);
-      for (const item of slice.bands.slice().sort((a, b) => a.band.zIndex - b.band.zIndex)) {
-        fillPolygons(image, viewport, [item.polygon], parseColor(item.band.color));
+    for (const slice of layer.localSlices) {
+      fillRingSets(image, viewport, slice.footprintRingSets, BACKGROUND);
+      for (const item of slice.bands) {
+        fillRingSets(image, viewport, item.ringSets, parseColor(item.band.color));
       }
     }
   });
@@ -302,10 +285,10 @@ function renderRoadDataIntoImage(image: Uint8Array, viewport: Viewport, data: Ro
 
 export function renderRoadSceneToImage(scene: RoadPenScene, options: RoadScenePngOptions = {}): RoadSceneImage {
   const data = buildRoadBandPolygons(scene);
-  const allPolygons = [...data.bandBuckets.values()].flatMap((bucket) => bucket.polygons);
-  const viewport = viewportFor(allPolygons, options.maxWidth ?? 1400, options.maxHeight ?? 1000, options.padding ?? 72);
+  const paintCache = buildRoadPaintCache(data);
+  const viewport = viewportFor(paintCache.allPolygons, options.maxWidth ?? 1400, options.maxHeight ?? 1000, options.padding ?? 72);
   const image = createImage(viewport.width, viewport.height, BACKGROUND);
-  renderRoadDataIntoImage(image, viewport, data);
+  renderRoadDataIntoImage(image, viewport, paintCache);
   return { width: viewport.width, height: viewport.height, image, data };
 }
 
